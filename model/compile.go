@@ -70,6 +70,7 @@ func compileState[C any](
 		transitions: make(map[core.EventType][]*compiledTransition[C]),
 		onEntry:     sc.onEntry,
 		onExit:      sc.onExit,
+		invokes:     sc.invokes,
 		final:       sc.final,
 	}
 

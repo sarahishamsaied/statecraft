@@ -1,6 +1,7 @@
 package testkit
 
 import (
+	"context"
 	"fmt"
 	"statecraft/core"
 	"statecraft/model"
@@ -42,6 +43,7 @@ type Harness[C any] struct {
 	internal  []core.Event
 	scheduler *harnessScheduler
 	steps     []Step[C]
+	invokes   []context.CancelFunc // active invoke cancel funcs
 }
 
 // NewHarness creates a Harness from a compiled Machine and immediately
@@ -225,7 +227,7 @@ func (h *Harness[C]) stepAlways() bool {
 // transition matches).
 func (h *Harness[C]) flush() {
 	const maxIter = 1000
-	for i := range maxIter {
+	for range maxIter {
 		if len(h.internal) > 0 {
 			ev := h.internal[0]
 			h.internal = h.internal[1:]
@@ -236,7 +238,6 @@ func (h *Harness[C]) flush() {
 			continue
 		}
 		return // stable
-		_ = i
 	}
 	panic("testkit.Harness: flush exceeded 1000 iterations — always-transition loop in state " +
 		string(h.state))
@@ -248,6 +249,7 @@ func (h *Harness[C]) doTransition(ev core.Event, target core.StateID, tActions [
 
 	h.doExit(h.state, ev)
 	h.stopStateTimers(h.state)
+	h.stopInvokes()
 
 	for _, a := range tActions {
 		h.ctx = a(h.ctx, ev, ac)
@@ -270,6 +272,23 @@ func (h *Harness[C]) doEntry(id core.StateID, ev core.Event) {
 		h.ctx = a(h.ctx, ev, ac)
 	}
 	h.internal = append(h.internal, ac.Drain()...)
+	// Start invocations. The send callback feeds directly into the internal
+	// queue — it is NOT goroutine-safe and must only be called synchronously
+	// within the InvokeFn body (not from a spawned goroutine).
+	for _, fn := range h.machine.InvokeFns(id) {
+		invokeCtx, cancel := context.WithCancel(context.Background())
+		h.invokes = append(h.invokes, cancel)
+		fn(invokeCtx, h.ctx, ev, func(sendEv core.Event) {
+			h.internal = append(h.internal, sendEv)
+		})
+	}
+}
+
+func (h *Harness[C]) stopInvokes() {
+	for _, cancel := range h.invokes {
+		cancel()
+	}
+	h.invokes = h.invokes[:0]
 }
 
 func (h *Harness[C]) doExit(id core.StateID, ev core.Event) {

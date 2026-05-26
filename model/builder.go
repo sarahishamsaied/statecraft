@@ -147,9 +147,19 @@ func (s *StateBuilder[C]) Exit(actions ...ActionFn[C]) *StateBuilder[C] {
 
 // Final marks this state as terminal. When the machine enters a final state
 // it keeps running (can still receive events) but exposes IsFinal() == true
-// on its snapshot. Phase 3 will propagate a done event to parent actors.
+// on its snapshot.
 func (s *StateBuilder[C]) Final() *StateBuilder[C] {
 	s.cfg.final = true
+	return s
+}
+
+// Invoke registers a function to be called when this state is entered.
+// The function runs immediately on entry and should spawn a goroutine for
+// any blocking work. The context it receives is cancelled when the state is
+// exited or the service is stopped, so the goroutine can clean up via ctx.Done().
+// Multiple Invoke calls on the same state are all started on entry.
+func (s *StateBuilder[C]) Invoke(fn InvokeFn[C]) *StateBuilder[C] {
+	s.cfg.invokes = append(s.cfg.invokes, fn)
 	return s
 }
 

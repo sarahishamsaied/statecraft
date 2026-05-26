@@ -45,6 +45,9 @@ type Service[C any] struct {
 	// ── Scheduler ─────────────────────────────────────────────────────────
 	scheduler *Scheduler
 
+	// ── Active invocations ────────────────────────────────────────────────
+	invokes []context.CancelFunc // cancel funcs for running invocations; owned by run goroutine
+
 	// ── Options ───────────────────────────────────────────────────────────
 	clock       core.Clock
 	mailboxSize int
@@ -105,7 +108,11 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 	svc.startStateTimers(svc.state)
 	svc.storeSnapshot(core.Init, false)
 
+	// Set running before starting invokes so that the send callback they
+	// receive can call svc.Send() without getting ErrActorStopped.
 	svc.status.Store(statusRunning)
+	svc.doInvokeEntry(svc.state, core.Init)
+
 	go svc.run(runCtx)
 	return svc
 }
@@ -186,6 +193,7 @@ func (s *Service[C]) State() core.StateID { return s.Snapshot().State }
 func (s *Service[C]) run(ctx context.Context) {
 	defer func() {
 		s.scheduler.CancelAll()
+		s.stopInvokes()
 		s.status.Store(statusStopped)
 		close(s.done)
 	}()
@@ -263,7 +271,7 @@ func (s *Service[C]) tryAlways() bool {
 }
 
 // doTransition executes the mechanical steps of any transition type:
-// exit, transition actions, state update, entry, timers, snapshot.
+// exit, transition actions, state update, entry, timers, invokes, snapshot.
 func (s *Service[C]) doTransition(ev core.Event, target core.StateID, tActions []model.ActionFn[C]) {
 	from := s.state
 	ac := &model.ActionContext{}
@@ -271,8 +279,9 @@ func (s *Service[C]) doTransition(ev core.Event, target core.StateID, tActions [
 	// 1. Exit current state.
 	s.doExit(s.state, ev)
 
-	// 2. Cancel timers scoped to the exited state.
+	// 2. Cancel timers and invocations scoped to the exited state.
 	s.stopStateTimers(s.state)
+	s.stopInvokes()
 
 	// 3. Execute transition actions.
 	for _, a := range tActions {
@@ -286,8 +295,9 @@ func (s *Service[C]) doTransition(ev core.Event, target core.StateID, tActions [
 	// 5. Enter new state.
 	s.doEntry(s.state, ev)
 
-	// 6. Start timers scoped to the entered state.
+	// 6. Start timers and invocations scoped to the entered state.
 	s.startStateTimers(s.state)
+	s.doInvokeEntry(s.state, ev)
 
 	// 7. Inject raised events.
 	if raised := ac.Drain(); len(raised) > 0 {
@@ -322,6 +332,30 @@ func (s *Service[C]) doExit(id core.StateID, ev core.Event) {
 		s.ctx = a(s.ctx, ev, ac)
 	}
 	s.internal = append(s.internal, ac.Drain()...)
+}
+
+// ─── Invoke helpers ───────────────────────────────────────────────────────────
+
+// doInvokeEntry starts all invoke functions registered for state id.
+// Each invoke receives a fresh cancellable context and a send callback that
+// routes events through the service mailbox.
+func (s *Service[C]) doInvokeEntry(id core.StateID, ev core.Event) {
+	fns := s.machine.InvokeFns(id)
+	for _, fn := range fns {
+		invokeCtx, cancel := context.WithCancel(context.Background())
+		s.invokes = append(s.invokes, cancel)
+		fn(invokeCtx, s.ctx, ev, func(sendEv core.Event) {
+			_ = s.Send(sendEv) // best-effort: ignore ErrActorStopped on shutdown
+		})
+	}
+}
+
+// stopInvokes cancels all active invocations and resets the slice.
+func (s *Service[C]) stopInvokes() {
+	for _, cancel := range s.invokes {
+		cancel()
+	}
+	s.invokes = s.invokes[:0]
 }
 
 // ─── Timer helpers ────────────────────────────────────────────────────────────

@@ -37,7 +37,7 @@ var guardedChain = func() *model.Machine[int] {
 			_ = threshold
 			_ = next
 		})
-		prev = prev // avoid capture confusion
+		_ = prev // avoid capture confusion
 	}
 	// Simpler: just build a 5-state linear chain.
 	return model.New[int]("chain").

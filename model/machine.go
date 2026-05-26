@@ -162,6 +162,15 @@ type AfterConf[C any] struct {
 	EventType core.EventType
 }
 
+// InvokeFns returns the invoke functions registered for a state.
+// The runtime calls each on entry and cancels their context on exit.
+func (m *Machine[C]) InvokeFns(id core.StateID) []InvokeFn[C] {
+	if s, ok := m.states[id]; ok {
+		return s.invokes
+	}
+	return nil
+}
+
 // AfterConfs returns all timer configurations registered for a state.
 func (m *Machine[C]) AfterConfs(id core.StateID) []AfterConf[C] {
 	s, ok := m.states[id]
@@ -214,6 +223,7 @@ type compiledState[C any] struct {
 	always      []*compiledTransition[C] // null/automatic transitions
 	onEntry     []ActionFn[C]
 	onExit      []ActionFn[C]
+	invokes     []InvokeFn[C]
 	final       bool
 }
 

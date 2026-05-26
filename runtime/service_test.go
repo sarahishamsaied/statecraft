@@ -1,6 +1,7 @@
 package runtime_test
 
 import (
+	"context"
 	"statecraft/core"
 	"statecraft/model"
 	"statecraft/runtime"
@@ -415,6 +416,157 @@ func TestService_TrySendFull(t *testing.T) {
 	err := svc.TrySend(core.E("X"))
 	if err != core.ErrActorStopped {
 		t.Errorf("TrySend on stopped service: got %v, want ErrActorStopped", err)
+	}
+}
+
+// ─── invoke (async services) ──────────────────────────────────────────────────
+
+func TestService_Invoke_SendsEventOnEntry(t *testing.T) {
+	// An invoke that calls send() synchronously drives the machine to final.
+	m := model.New[struct{}]("m").
+		Initial("idle").
+		State("idle", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(_ context.Context, _ struct{}, _ core.Event, send func(core.Event)) {
+				send(core.E("AUTO"))
+			})
+			s.On("AUTO", "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	select {
+	case <-waitForFinal(svc):
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for final state")
+	}
+}
+
+func TestService_Invoke_ContextCancelledOnExit(t *testing.T) {
+	cancelled := make(chan struct{})
+
+	m := model.New[struct{}]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(ctx context.Context, _ struct{}, _ core.Event, _ func(core.Event)) {
+				go func() {
+					<-ctx.Done()
+					close(cancelled)
+				}()
+			})
+			s.On("LEAVE", "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := awaitState(svc, "done")
+	mustSend(t, svc, core.E("LEAVE"))
+	assertState(t, ch, "done")
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("invoke context not cancelled after state exit")
+	}
+}
+
+func TestService_Invoke_AsyncResult(t *testing.T) {
+	// Invoke spawns a goroutine that sends an event after a short delay.
+	m := model.New[struct{}]("m").
+		Initial("fetching").
+		State("fetching", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(ctx context.Context, _ struct{}, _ core.Event, send func(core.Event)) {
+				go func() {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(20 * time.Millisecond):
+						send(core.E("DONE"))
+					}
+				}()
+			})
+			s.On("DONE", "complete")
+		}).
+		State("complete", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	select {
+	case <-waitForFinal(svc):
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async invoke result")
+	}
+}
+
+func TestService_Invoke_CancelledOnStop(t *testing.T) {
+	// Stopping the service cancels the active invocation's context.
+	cancelled := make(chan struct{})
+
+	m := model.New[struct{}]("m").
+		Initial("running").
+		State("running", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(ctx context.Context, _ struct{}, _ core.Event, _ func(core.Event)) {
+				go func() {
+					<-ctx.Done()
+					close(cancelled)
+				}()
+			})
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	svc.Stop()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("invoke context not cancelled after service stop")
+	}
+}
+
+func TestService_Invoke_MultipleInvokes(t *testing.T) {
+	// Two invokes on the same state — both must start and both contexts
+	// must be cancelled when the state is exited.
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	m := model.New[struct{}]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) {
+			for range 2 {
+				s.Invoke(func(ctx context.Context, _ struct{}, _ core.Event, _ func(core.Event)) {
+					go func() {
+						<-ctx.Done()
+						wg.Done()
+					}()
+				})
+			}
+			s.On("STOP", "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := awaitState(svc, "done")
+	mustSend(t, svc, core.E("STOP"))
+	assertState(t, ch, "done")
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("not all invoke contexts were cancelled after state exit")
 	}
 }
 

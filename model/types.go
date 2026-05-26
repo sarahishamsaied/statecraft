@@ -22,6 +22,7 @@ type stateConfig[C any] struct {
 	always      []transitionConfig[C] // null/automatic transitions — no event trigger
 	onEntry     []ActionFn[C]
 	onExit      []ActionFn[C]
+	invokes     []InvokeFn[C]
 }
 
 type transitionConfig[C any] struct {

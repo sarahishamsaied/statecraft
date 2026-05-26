@@ -1,6 +1,7 @@
 package testkit_test
 
 import (
+	"context"
 	"statecraft/core"
 	"statecraft/model"
 	"statecraft/runtime"
@@ -400,6 +401,76 @@ func TestHarness_Tick_MultipleTimers(t *testing.T) {
 	h.AssertState(t, "b")
 	h.Tick(3 * time.Second) // fires b→c
 	h.AssertFinal(t)
+}
+
+// ─── Harness: invoke ──────────────────────────────────────────────────────────
+
+func TestHarness_Invoke_SynchronousSend(t *testing.T) {
+	// Invoke calls send() synchronously — event enters internal queue and the
+	// harness flush drives the machine to final without any external Send.
+	m := model.New[struct{}]("m").
+		Initial("idle").
+		State("idle", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(_ context.Context, _ struct{}, _ core.Event, send func(core.Event)) {
+				send(core.E("AUTO"))
+			})
+			s.On("AUTO", "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "done")
+	h.AssertFinal(t)
+}
+
+func TestHarness_Invoke_ContextCancelledOnExit(t *testing.T) {
+	// Exiting a state cancels the invoke's context.
+	cancelled := make(chan struct{}, 1)
+
+	m := model.New[struct{}]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(ctx context.Context, _ struct{}, _ core.Event, _ func(core.Event)) {
+				go func() {
+					<-ctx.Done()
+					cancelled <- struct{}{}
+				}()
+			})
+			s.On("LEAVE", "done")
+		}).
+		State("done").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.Send(core.E("LEAVE"))
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("invoke context not cancelled after state exit in harness")
+	}
+}
+
+func TestHarness_Invoke_EntryContextReceivesMachineCtx(t *testing.T) {
+	// The machineCtx snapshot passed to the invoke matches context at entry time.
+	type Ctx struct{ Value int }
+	var gotValue int
+
+	m := model.New[Ctx]("m").
+		Context(Ctx{Value: 42}).
+		Initial("active").
+		State("active", func(s *model.StateBuilder[Ctx]) {
+			s.Invoke(func(_ context.Context, c Ctx, _ core.Event, _ func(core.Event)) {
+				gotValue = c.Value
+			})
+		}).
+		MustBuild()
+
+	testkit.NewHarness(m)
+	if gotValue != 42 {
+		t.Errorf("invoke received machineCtx.Value = %d, want 42", gotValue)
+	}
 }
 
 // ─── MockClock integration with live Service ──────────────────────────────────
