@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"statecraft/core"
 	"statecraft/model"
 	"sync/atomic"
@@ -48,10 +49,17 @@ type Service[C any] struct {
 	// ── Active invocations ────────────────────────────────────────────────
 	invokes []context.CancelFunc // cancel funcs for running invocations; owned by run goroutine
 
+	// ── Fault capture ─────────────────────────────────────────────────────
+	panicErr atomic.Value // stores panicVal; non-nil if run goroutine panicked
+
 	// ── Options ───────────────────────────────────────────────────────────
 	clock       core.Clock
 	mailboxSize int
 }
+
+// panicVal wraps a recovered panic so it can be stored in an atomic.Value
+// (which requires a concrete non-nil type, not a bare interface).
+type panicVal struct{ err error }
 
 // ServiceOptions holds configuration for a Service.
 // Use the With* option functions to set individual fields.
@@ -184,6 +192,17 @@ func (s *Service[C]) Stop() {
 // Use it to wait for shutdown without calling Stop().
 func (s *Service[C]) Done() <-chan struct{} { return s.done }
 
+// Err returns the recovered panic value if the service stopped due to an
+// unhandled panic in the run goroutine. Returns nil if the service was stopped
+// cleanly via Stop() or context cancellation. Safe to call from any goroutine
+// after Done() is closed.
+func (s *Service[C]) Err() error {
+	if v := s.panicErr.Load(); v != nil {
+		return v.(panicVal).err
+	}
+	return nil
+}
+
 // State returns the currently active state ID.
 // Sugar for s.Snapshot().State.
 func (s *Service[C]) State() core.StateID { return s.Snapshot().State }
@@ -192,6 +211,9 @@ func (s *Service[C]) State() core.StateID { return s.Snapshot().State }
 
 func (s *Service[C]) run(ctx context.Context) {
 	defer func() {
+		if r := recover(); r != nil {
+			s.panicErr.Store(panicVal{fmt.Errorf("%v", r)})
+		}
 		s.scheduler.CancelAll()
 		s.stopInvokes()
 		s.status.Store(statusStopped)

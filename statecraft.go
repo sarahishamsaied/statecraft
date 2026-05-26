@@ -22,6 +22,7 @@
 package statecraft
 
 import (
+	"statecraft/actor"
 	"statecraft/core"
 	"statecraft/model"
 	"statecraft/runtime"
@@ -147,3 +148,41 @@ func WithMailboxSize(n int) func(*runtime.ServiceOptions) {
 func WithClock(c core.Clock) func(*runtime.ServiceOptions) {
 	return runtime.WithClock(c)
 }
+
+// ─── Actor runtime ────────────────────────────────────────────────────────────
+
+// ActorSystem is a named registry of actors with coordinated lifecycle.
+type ActorSystem = actor.System
+
+// ActorRef[C] is a typed, persistent handle to a named actor.
+type ActorRef[C any] = actor.Ref[C]
+
+// SupervisionStrategy controls restart behaviour on actor panic.
+type SupervisionStrategy = actor.SupervisionStrategy
+
+const (
+	NoRestart     = actor.NoRestart
+	RestartAlways = actor.RestartAlways
+	RestartN      = actor.RestartN
+)
+
+// NewSystem creates an empty actor system.
+func NewSystem() *actor.System { return actor.NewSystem() }
+
+// Spawn creates a named actor in sys and starts it immediately.
+func Spawn[C any](sys *actor.System, id string, m *model.Machine[C], opts ...actor.SpawnOption) (*actor.Ref[C], error) {
+	return actor.Spawn(sys, id, m, opts...)
+}
+
+// MustSpawn is like Spawn but panics on error.
+func MustSpawn[C any](sys *actor.System, id string, m *model.Machine[C], opts ...actor.SpawnOption) *actor.Ref[C] {
+	return actor.MustSpawn(sys, id, m, opts...)
+}
+
+// WithActorStrategy sets the supervision strategy for a spawned actor.
+func WithActorStrategy(s actor.SupervisionStrategy, maxRestarts int) actor.SpawnOption {
+	return actor.WithStrategy(s, maxRestarts)
+}
+
+// InvokeFn[C] starts an async side-effect when a state is entered.
+type InvokeFn[C any] = model.InvokeFn[C]
