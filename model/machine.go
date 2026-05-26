@@ -89,9 +89,10 @@ func (m *Machine[C]) ExitActions(id core.StateID) []ActionFn[C] {
 type TransitionInfo struct {
 	From     string
 	To       string
-	Event    string // "" for after-transitions (use Delay instead)
-	Delay    time.Duration
+	Event    string        // "" for after/always transitions
+	Delay    time.Duration // non-zero for after-transitions
 	IsAfter  bool
+	IsAlways bool
 	HasGuard bool
 }
 
@@ -125,10 +126,20 @@ func (m *Machine[C]) Transitions() []TransitionInfo {
 		// After-transitions.
 		for _, ac := range s.afterConfs {
 			out = append(out, TransitionInfo{
-				From:    string(id),
-				To:      string(ac.transition.target),
-				Delay:   ac.delay,
-				IsAfter: true,
+				From:     string(id),
+				To:       string(ac.transition.target),
+				Delay:    ac.delay,
+				IsAfter:  true,
+				HasGuard: ac.transition.guard != nil,
+			})
+		}
+		// Always transitions.
+		for _, ct := range s.always {
+			out = append(out, TransitionInfo{
+				From:     string(id),
+				To:       string(ct.target),
+				IsAlways: true,
+				HasGuard: ct.guard != nil,
 			})
 		}
 	}
@@ -168,12 +179,39 @@ func (m *Machine[C]) AfterConfs(id core.StateID) []AfterConf[C] {
 	return out
 }
 
+// ResolveAlways finds the first enabled automatic transition for the current
+// state. Always transitions are evaluated after every step, in definition order.
+// Returns (target, actions, true) when one matches, ("", nil, false) otherwise.
+func (m *Machine[C]) ResolveAlways(
+	stateID core.StateID,
+	ctx C,
+) (target core.StateID, actions []ActionFn[C], ok bool) {
+	s, exists := m.states[stateID]
+	if !exists {
+		return "", nil, false
+	}
+	for _, ct := range s.always {
+		if ct.guard == nil || ct.guard(ctx, AlwaysEvent{}) {
+			return ct.target, ct.actions, true
+		}
+	}
+	return "", nil, false
+}
+
+// AlwaysEvent is the synthetic event passed to guards and actions in
+// always transitions. It carries no user-visible payload.
+// Guards and actions can detect it via type assertion when needed.
+type AlwaysEvent struct{}
+
+func (AlwaysEvent) Type() core.EventType { return core.EventTypeAlways }
+
 // ─── Internal compiled types ─────────────────────────────────────────────────
 
 type compiledState[C any] struct {
 	id          core.StateID
 	transitions map[core.EventType][]*compiledTransition[C]
 	afterConfs  []*compiledAfter[C]
+	always      []*compiledTransition[C] // null/automatic transitions
 	onEntry     []ActionFn[C]
 	onExit      []ActionFn[C]
 	final       bool

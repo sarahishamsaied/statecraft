@@ -14,6 +14,10 @@ type Snapshot[C any] struct {
 	// for hierarchical and parallel configurations.
 	State core.StateID
 
+	// PreviousState is the state that was active before the last transition.
+	// Empty string if the machine has never transitioned.
+	PreviousState core.StateID
+
 	// Context is a copy of the machine context at the time of this snapshot.
 	Context C
 

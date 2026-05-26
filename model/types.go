@@ -19,6 +19,7 @@ type stateConfig[C any] struct {
 	final       bool
 	transitions []transitionConfig[C]
 	afterConfs  []afterStateConfig[C]
+	always      []transitionConfig[C] // null/automatic transitions — no event trigger
 	onEntry     []ActionFn[C]
 	onExit      []ActionFn[C]
 }

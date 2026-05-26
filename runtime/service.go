@@ -27,9 +27,10 @@ type Service[C any] struct {
 	machine *model.Machine[C]
 
 	// ── Interpreter state (owned by the run goroutine) ────────────────────
-	state    core.StateID
-	ctx      C
-	internal []core.Event // internal queue — drained before the mailbox
+	state         core.StateID
+	previousState core.StateID // last state before the most recent transition
+	ctx           C
+	internal      []core.Event // internal queue — drained before the mailbox
 
 	// ── Concurrency primitives ────────────────────────────────────────────
 	mailbox   chan core.Envelope   // external event channel
@@ -96,8 +97,12 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 		mailboxSize: o.mailboxSize,
 	}
 
-	// Store initial snapshot before the goroutine starts so that callers
-	// who read Snapshot() immediately after Start() get a valid value.
+	// Perform initial state setup synchronously so that callers using a
+	// MockClock can advance time immediately after Start() returns.
+	// Entry actions, timer registration, and the initial snapshot are all
+	// visible to the caller before the run goroutine starts.
+	svc.doEntry(svc.state, core.Init)
+	svc.startStateTimers(svc.state)
 	svc.storeSnapshot(core.Init, false)
 
 	svc.status.Store(statusRunning)
@@ -185,18 +190,10 @@ func (s *Service[C]) run(ctx context.Context) {
 		close(s.done)
 	}()
 
-	// Execute entry actions for the initial state.
-	s.doEntry(s.state, core.Init)
-	// Start any after-timers configured on the initial state.
-	s.startStateTimers(s.state)
-	// Publish the post-entry snapshot.
-	s.storeAndNotify(core.Init, false)
-
 	for {
-		// ── Internal events have priority (SCXML §5.2) ─────────────────
-		// Raised events from actions are always processed before the next
-		// external event arrives. This ensures that action-driven state
-		// chains complete atomically from an outside observer's perspective.
+		// ── Priority 1: internal events (SCXML §5.2) ────────────────────
+		// Raised events are processed before any external event, ensuring
+		// action-driven state chains appear atomic to outside observers.
 		if len(s.internal) > 0 {
 			ev := s.internal[0]
 			s.internal = s.internal[1:]
@@ -204,7 +201,14 @@ func (s *Service[C]) run(ctx context.Context) {
 			continue
 		}
 
-		// ── Wait for the next event source ─────────────────────────────
+		// ── Priority 2: always transitions ──────────────────────────────
+		// Evaluated after the internal queue empties. If one fires it may
+		// raise internal events, so we go back to the top of the loop.
+		if s.tryAlways() {
+			continue
+		}
+
+		// ── Priority 3: external events (mailbox + scheduler) ───────────
 		select {
 		case <-ctx.Done():
 			return
@@ -216,10 +220,9 @@ func (s *Service[C]) run(ctx context.Context) {
 			s.step(env.Event)
 
 		case tf := <-s.scheduler.C():
-			// Stale timer guard: the timer event type is scoped to the
-			// state that scheduled it (via the timerID suffix). If the
-			// machine has since left that state, ResolveTransition will
-			// simply return false and the event is silently dropped.
+			// Timer event types are state-scoped. If the machine has since
+			// left the state that started this timer, ResolveTransition
+			// returns false and the event is silently dropped.
 			s.step(tf.Event)
 		}
 	}
@@ -234,8 +237,35 @@ func (s *Service[C]) step(ev core.Event) {
 		// Subscribers are NOT notified (nothing changed).
 		return
 	}
+	s.doTransition(ev, target, tActions)
+}
 
-	prevState := s.state
+// tryAlways evaluates always transitions for the current state.
+// Returns true if one fired (caller should re-check internal queue).
+// Panics if always transitions loop more than maxAlwaysIter times without
+// an external event — indicates a missing guard.
+func (s *Service[C]) tryAlways() bool {
+	const maxAlwaysIter = 1000
+	for range maxAlwaysIter {
+		target, tActions, ok := s.machine.ResolveAlways(s.state, s.ctx)
+		if !ok {
+			return false
+		}
+		s.doTransition(model.AlwaysEvent{}, target, tActions)
+		// If internal events were raised, stop here — the main loop will
+		// drain them before checking always again.
+		if len(s.internal) > 0 {
+			return true
+		}
+	}
+	panic("statecraft: always-transition loop — " + string(s.state) +
+		" has an unguarded always transition that keeps re-entering itself")
+}
+
+// doTransition executes the mechanical steps of any transition type:
+// exit, transition actions, state update, entry, timers, snapshot.
+func (s *Service[C]) doTransition(ev core.Event, target core.StateID, tActions []model.ActionFn[C]) {
+	from := s.state
 	ac := &model.ActionContext{}
 
 	// 1. Exit current state.
@@ -250,6 +280,7 @@ func (s *Service[C]) step(ev core.Event) {
 	}
 
 	// 4. Update active state.
+	s.previousState = s.state
 	s.state = target
 
 	// 5. Enter new state.
@@ -258,13 +289,13 @@ func (s *Service[C]) step(ev core.Event) {
 	// 6. Start timers scoped to the entered state.
 	s.startStateTimers(s.state)
 
-	// 7. Inject any raised events from transition + entry actions.
+	// 7. Inject raised events.
 	if raised := ac.Drain(); len(raised) > 0 {
 		s.internal = append(s.internal, raised...)
 	}
 
-	// 8. Publish snapshot. Changed == true because the state transition fired.
-	s.storeAndNotify(ev, s.state != prevState)
+	// 8. Publish snapshot.
+	s.storeAndNotify(ev, s.state != from)
 }
 
 // ─── Lifecycle helpers ────────────────────────────────────────────────────────
@@ -312,12 +343,13 @@ func (s *Service[C]) stopStateTimers(id core.StateID) {
 
 func (s *Service[C]) storeSnapshot(ev core.Event, changed bool) {
 	s.snap.Store(Snapshot[C]{
-		State:   s.state,
-		Context: s.ctx,
-		Event:   ev,
-		Changed: changed,
-		Final:   s.machine.IsFinal(s.state),
-		At:      time.Now(),
+		State:         s.state,
+		PreviousState: s.previousState,
+		Context:       s.ctx,
+		Event:         ev,
+		Changed:       changed,
+		Final:         s.machine.IsFinal(s.state),
+		At:            time.Now(),
 	})
 }
 

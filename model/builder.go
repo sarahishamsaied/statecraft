@@ -93,6 +93,29 @@ func (s *StateBuilder[C]) On(event, target string, opts ...TransitionOption[C]) 
 	return s
 }
 
+// Always adds an automatic (null) transition that is evaluated after every
+// event step — including initial state entry. The first Always whose guard
+// passes fires immediately, without waiting for any external event.
+//
+// Always transitions are checked in definition order. A guardless Always
+// must target a different state (compile-time enforced) to prevent an
+// infinite loop. A guarded Always may target the same state only if the
+// guard will eventually become false.
+//
+// Common pattern: routing states that redirect based on context.
+//
+//	s.Always("paid",    model.When[C](func(c C, _ core.Event) bool { return c.Balance >= c.Price }))
+//	s.Always("overdue", model.When[C](func(c C, _ core.Event) bool { return c.DaysPastDue > 30 }))
+//	s.Always("pending") // fallback — always fires if none above matched
+func (s *StateBuilder[C]) Always(target string, opts ...TransitionOption[C]) *StateBuilder[C] {
+	tc := transitionConfig[C]{target: target}
+	for _, o := range opts {
+		o(&tc)
+	}
+	s.cfg.always = append(s.cfg.always, tc)
+	return s
+}
+
 // After adds a delayed transition that fires after duration d if the machine
 // is still in this state. Timers are scoped to the state: exiting the state
 // cancels the timer automatically, preventing stale timer events.

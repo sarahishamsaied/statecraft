@@ -129,6 +129,32 @@ func compileState[C any](
 		cs.transitions[evType] = append(cs.transitions[evType], ct)
 	}
 
+	// ── Always transitions ──────────────────────────────────────────────────
+	// Compile-time rule: a guardless always transition that targets the same
+	// state it is declared on creates an unconditional infinite loop.
+	// We detect and reject it here rather than panicking at runtime.
+	for i, tc := range sc.always {
+		if tc.target == "" {
+			return nil, fmt.Errorf("%w: always-transition %d in state %q has no target",
+				core.ErrInvalidMachine, i, sc.id)
+		}
+		if _, ok := knownIDs[tc.target]; !ok {
+			return nil, fmt.Errorf("%w: state %q always-transition %d → %q (undefined)",
+				core.ErrUnknownTarget, sc.id, i, tc.target)
+		}
+		if tc.target == sc.id && tc.guard == nil {
+			return nil, fmt.Errorf(
+				"%w: state %q always-transition %d targets itself with no guard — infinite loop",
+				core.ErrInvalidMachine, sc.id, i)
+		}
+		ct := &compiledTransition[C]{
+			target:  core.StateID(tc.target),
+			guard:   tc.guard,
+			actions: tc.actions,
+		}
+		cs.always = append(cs.always, ct)
+	}
+
 	return cs, nil
 }
 

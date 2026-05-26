@@ -12,6 +12,7 @@ const (
 	EventTypeDone   EventType = "statecraft.done"
 	EventTypeError  EventType = "statecraft.error"
 	EventTypeAfter  EventType = "statecraft.after"
+	EventTypeAlways EventType = "statecraft.always" // synthetic event for always transitions
 )
 
 // Event is the core interface. Every message sent to a state machine must

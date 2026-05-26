@@ -1,0 +1,506 @@
+package testkit_test
+
+import (
+	"statecraft/core"
+	"statecraft/model"
+	"statecraft/runtime"
+	"statecraft/testkit"
+	"testing"
+	"time"
+)
+
+// ─── Always transitions ───────────────────────────────────────────────────────
+
+func TestAlways_FiredOnInitialEntry(t *testing.T) {
+	// The machine starts in "routing" which has a guardless always to "active".
+	// The harness should land in "active" after NewHarness.
+	m := model.New[struct{}]("m").
+		Initial("routing").
+		State("routing", func(s *model.StateBuilder[struct{}]) {
+			s.Always("active")
+		}).
+		State("active").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "active")
+	h.AssertSteps(t, "routing→active")
+}
+
+func TestAlways_ChainedThroughMultipleStates(t *testing.T) {
+	// routing → a → b, all via always transitions.
+	m := model.New[struct{}]("m").
+		Initial("routing").
+		State("routing", func(s *model.StateBuilder[struct{}]) { s.Always("a") }).
+		State("a", func(s *model.StateBuilder[struct{}]) { s.Always("b") }).
+		State("b").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "b")
+	h.AssertSteps(t, "routing→a", "a→b")
+}
+
+func TestAlways_GuardedRouting(t *testing.T) {
+	// "routing" state acts as a switch: redirect based on context.
+	type Ctx struct{ Role string }
+
+	m := model.New[Ctx]("m").
+		Initial("routing").
+		State("routing", func(s *model.StateBuilder[Ctx]) {
+			s.Always("admin",
+				model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.Role == "admin" }))
+			s.Always("user",
+				model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.Role == "user" }))
+			s.Always("guest") // fallback
+		}).
+		State("admin").
+		State("user").
+		State("guest").
+		MustBuild()
+
+	cases := []struct {
+		role string
+		want string
+	}{
+		{"admin", "admin"},
+		{"user", "user"},
+		{"", "guest"},
+		{"unknown", "guest"},
+	}
+
+	for _, tc := range cases {
+		m2 := model.New[Ctx]("m").
+			Context(Ctx{Role: tc.role}).
+			Initial("routing").
+			State("routing", func(s *model.StateBuilder[Ctx]) {
+				s.Always("admin", model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.Role == "admin" }))
+				s.Always("user", model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.Role == "user" }))
+				s.Always("guest")
+			}).
+			State("admin").State("user").State("guest").
+			MustBuild()
+
+		h := testkit.NewHarness(m2)
+		if h.State() != core.StateID(tc.want) {
+			t.Errorf("role=%q: state=%q, want=%q", tc.role, h.State(), tc.want)
+		}
+	}
+	_ = m
+}
+
+func TestAlways_FiredAfterExternalEvent(t *testing.T) {
+	// Event "SUBMIT" moves to "validating", which has an always that
+	// immediately redirects to "ok" or "err" based on context.
+	type Ctx struct{ Valid bool }
+
+	m := model.New[Ctx]("m").
+		Initial("idle").
+		State("idle", func(s *model.StateBuilder[Ctx]) {
+			s.On("SUBMIT", "validating",
+				model.Do(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Valid = true
+					return c
+				})),
+			)
+		}).
+		State("validating", func(s *model.StateBuilder[Ctx]) {
+			s.Always("ok", model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.Valid }))
+			s.Always("err")
+		}).
+		State("ok").
+		State("err").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "idle")
+
+	h.MustTransition(t, core.E("SUBMIT"))
+	// Should have passed through "validating" and landed in "ok"
+	h.AssertState(t, "ok")
+	// Steps: idle→validating, validating→ok
+	h.AssertSteps(t, "idle→validating", "validating→ok")
+}
+
+func TestAlways_GuardedSelfLoop_DetectedAtCompile(t *testing.T) {
+	_, err := model.New[struct{}]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[struct{}]) {
+			s.Always("a") // guardless self-loop — must be rejected
+		}).
+		Build()
+	if err == nil {
+		t.Fatal("expected compile error for guardless self-loop, got nil")
+	}
+}
+
+func TestAlways_RaisedEventFromAlways(t *testing.T) {
+	// The always action raises an internal event which causes a further step.
+	type Ctx struct{ Path []string }
+
+	m := model.New[Ctx]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[Ctx]) {
+			s.Always("b",
+				model.Do(model.Raise(func(_ Ctx, _ core.Event) core.Event {
+					return core.E("INTERNAL")
+				})),
+			)
+		}).
+		State("b", func(s *model.StateBuilder[Ctx]) {
+			s.On("INTERNAL", "c")
+		}).
+		State("c").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "c")
+}
+
+// ─── Snapshot.PreviousState ───────────────────────────────────────────────────
+
+func TestPreviousState_InRuntime(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[struct{}]) { s.On("NEXT", "b") }).
+		State("b", func(s *model.StateBuilder[struct{}]) { s.On("NEXT", "c") }).
+		State("c").
+		MustBuild()
+
+	svc := startSvc(m)
+	defer svc.Stop()
+
+	snap := svc.Snapshot()
+	if snap.PreviousState != "" {
+		t.Errorf("initial PreviousState = %q, want empty", snap.PreviousState)
+	}
+
+	ch := awaitState(svc, "b")
+	_ = svc.Send(core.E("NEXT"))
+	snap = <-ch
+	if snap.PreviousState != "a" {
+		t.Errorf("PreviousState after a→b = %q, want %q", snap.PreviousState, "a")
+	}
+
+	ch = awaitState(svc, "c")
+	_ = svc.Send(core.E("NEXT"))
+	snap = <-ch
+	if snap.PreviousState != "b" {
+		t.Errorf("PreviousState after b→c = %q, want %q", snap.PreviousState, "b")
+	}
+}
+
+func TestPreviousState_InHarness(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[struct{}]) { s.On("GO", "b") }).
+		State("b").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	if h.PreviousState() != "" {
+		t.Errorf("initial PreviousState = %q, want empty", h.PreviousState())
+	}
+
+	h.MustTransition(t, core.E("GO"))
+	h.AssertPreviousState(t, "a")
+}
+
+// ─── Harness: basic behaviour ─────────────────────────────────────────────────
+
+func TestHarness_InitialState(t *testing.T) {
+	m := trafficMachine()
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "red")
+	h.AssertNotFinal(t)
+}
+
+func TestHarness_Send(t *testing.T) {
+	h := testkit.NewHarness(trafficMachine())
+	h.MustTransition(t, core.E("TIMER"))
+	h.AssertState(t, "green")
+}
+
+func TestHarness_MultipleTransitions(t *testing.T) {
+	h := testkit.NewHarness(trafficMachine())
+	for _, want := range []string{"green", "yellow", "red", "green"} {
+		h.MustTransition(t, core.E("TIMER"))
+		h.AssertState(t, want)
+	}
+}
+
+func TestHarness_ContextMutation(t *testing.T) {
+	type Ctx struct{ Count int }
+	m := model.New[Ctx]("m").
+		Context(Ctx{}).
+		Initial("a").
+		State("a", func(s *model.StateBuilder[Ctx]) {
+			s.On("INC", "a",
+				model.Do(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Count++
+					return c
+				})),
+			)
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	for range 5 {
+		h.Send(core.E("INC"))
+	}
+	h.AssertContext(t, func(c Ctx) bool { return c.Count == 5 }, "Count should be 5")
+}
+
+func TestHarness_UnhandledEvent(t *testing.T) {
+	h := testkit.NewHarness(trafficMachine())
+	if h.Send(core.E("UNKNOWN")) {
+		t.Error("Send returned true for unhandled event")
+	}
+	h.AssertState(t, "red") // unchanged
+}
+
+func TestHarness_StepsRecorded(t *testing.T) {
+	h := testkit.NewHarness(trafficMachine())
+	h.Send(core.E("TIMER"))
+	h.Send(core.E("TIMER"))
+	h.AssertSteps(t, "red→green", "green→yellow")
+}
+
+func TestHarness_EntryExitActionsExecuted(t *testing.T) {
+	type Ctx struct{ Log []string }
+	m := model.New[Ctx]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:a")
+				return c
+			}))
+			s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "exit:a")
+				return c
+			}))
+			s.On("GO", "b")
+		}).
+		State("b", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:b")
+				return c
+			}))
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.Send(core.E("GO"))
+	h.AssertContext(t, func(c Ctx) bool {
+		return len(c.Log) == 3 &&
+			c.Log[0] == "enter:a" &&
+			c.Log[1] == "exit:a" &&
+			c.Log[2] == "enter:b"
+	}, "log mismatch")
+}
+
+func TestHarness_FinalState(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) { s.On("DONE", "end") }).
+		State("end", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.Send(core.E("DONE"))
+	h.AssertFinal(t)
+}
+
+func TestHarness_RaisedEventChain(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[struct{}]) {
+			s.On("KICK", "b", model.Do(model.Raise(func(_ struct{}, _ core.Event) core.Event {
+				return core.E("BOUNCE")
+			})))
+		}).
+		State("b", func(s *model.StateBuilder[struct{}]) {
+			s.On("BOUNCE", "c")
+		}).
+		State("c").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.Send(core.E("KICK"))
+	h.AssertState(t, "c")
+}
+
+// ─── Harness: timer (Tick) ────────────────────────────────────────────────────
+
+func TestHarness_Tick_FiresAfterTimer(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("waiting").
+		State("waiting", func(s *model.StateBuilder[struct{}]) {
+			s.After(5*time.Second, "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "waiting")
+
+	n := h.Tick(4 * time.Second) // before deadline
+	if n != 0 {
+		t.Errorf("Tick(4s) fired %d transitions, want 0", n)
+	}
+	h.AssertState(t, "waiting")
+
+	n = h.Tick(1 * time.Second) // exactly at deadline
+	if n != 1 {
+		t.Errorf("Tick(1s) fired %d transitions, want 1", n)
+	}
+	h.AssertFinal(t)
+}
+
+func TestHarness_Tick_CancelledOnExit(t *testing.T) {
+	type Ctx struct{ Fired bool }
+	m := model.New[Ctx]("m").
+		Initial("waiting").
+		State("waiting", func(s *model.StateBuilder[Ctx]) {
+			s.On("LEAVE", "other")
+			s.After(10*time.Second, "timeout",
+				model.Do(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Fired = true
+					return c
+				})))
+		}).
+		State("other").
+		State("timeout").
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.Send(core.E("LEAVE")) // exit waiting — timer should be cancelled
+	h.Tick(20 * time.Second)
+
+	h.AssertState(t, "other")
+	h.AssertContext(t, func(c Ctx) bool { return !c.Fired }, "timer fired after exit")
+}
+
+func TestHarness_Tick_MultipleTimers(t *testing.T) {
+	// Two states each with after-timers; machine only fires the one for the
+	// state it's in.
+	m := model.New[struct{}]("m").
+		Initial("a").
+		State("a", func(s *model.StateBuilder[struct{}]) {
+			s.After(2*time.Second, "b")
+		}).
+		State("b", func(s *model.StateBuilder[struct{}]) {
+			s.After(3*time.Second, "c")
+		}).
+		State("c", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.Tick(2 * time.Second) // fires a→b
+	h.AssertState(t, "b")
+	h.Tick(3 * time.Second) // fires b→c
+	h.AssertFinal(t)
+}
+
+// ─── MockClock integration with live Service ──────────────────────────────────
+
+func TestMockClock_WithService(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("waiting").
+		State("waiting", func(s *model.StateBuilder[struct{}]) {
+			s.After(100*time.Millisecond, "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	clock := testkit.NewMockClock(time.Now())
+	svc := startSvc(m, withClock(clock))
+	defer svc.Stop()
+
+	// Before advancing: still in "waiting".
+	if svc.Snapshot().Is("done") {
+		t.Fatal("already in done before clock advance")
+	}
+
+	// Subscribe to the transition.
+	ch := make(chan struct{}, 1)
+	svc.Subscribe(func(snap runtime.Snapshot[struct{}]) {
+		if snap.Is("done") {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	clock.Advance(100 * time.Millisecond)
+
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for done state after clock advance")
+	}
+}
+
+// ─── Viz: always transitions appear in diagram ───────────────────────────────
+
+func TestAlways_InViz(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("routing").
+		State("routing", func(s *model.StateBuilder[struct{}]) {
+			s.Always("active")
+		}).
+		State("active").
+		MustBuild()
+
+	found := false
+	for _, ti := range m.Transitions() {
+		if ti.IsAlways && ti.From == "routing" && ti.To == "active" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("always transition not found in Machine.Transitions()")
+	}
+}
+
+// ─── helpers / fixtures ───────────────────────────────────────────────────────
+
+type lightCtx struct{ Cycles int }
+
+func trafficMachine() *model.Machine[lightCtx] {
+	return model.New[lightCtx]("traffic").
+		Context(lightCtx{}).
+		Initial("red").
+		State("red", func(s *model.StateBuilder[lightCtx]) { s.On("TIMER", "green") }).
+		State("green", func(s *model.StateBuilder[lightCtx]) { s.On("TIMER", "yellow") }).
+		State("yellow", func(s *model.StateBuilder[lightCtx]) { s.On("TIMER", "red") }).
+		MustBuild()
+}
+
+// ─── runtime helpers ─────────────────────────────────────────────────────────
+
+func startSvc[C any](m *model.Machine[C], opts ...func(*runtime.ServiceOptions)) *runtime.Service[C] {
+	return runtime.Start(m, opts...)
+}
+
+func withClock(c core.Clock) func(*runtime.ServiceOptions) {
+	return runtime.WithClock(c)
+}
+
+// awaitState subscribes and returns a channel that receives the first snapshot
+// where the machine is in state id. The subscription is cancelled after delivery.
+func awaitState[C any](svc *runtime.Service[C], id string) <-chan runtime.Snapshot[C] {
+	ch := make(chan runtime.Snapshot[C], 1)
+	var unsub runtime.UnsubscribeFn
+	unsub = svc.Subscribe(func(snap runtime.Snapshot[C]) {
+		if snap.Is(id) {
+			select {
+			case ch <- snap:
+			default:
+			}
+			unsub()
+		}
+	})
+	return ch
+}
