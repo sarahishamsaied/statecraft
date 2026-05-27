@@ -6,6 +6,10 @@ var (
 	// ErrActorStopped is returned when sending an event to a stopped service.
 	ErrActorStopped = errors.New("statecraft: service is stopped")
 
+	// ErrInvalidCheckpoint is returned when a checkpoint is malformed or
+	// references states that do not exist in the target machine.
+	ErrInvalidCheckpoint = errors.New("statecraft: invalid checkpoint")
+
 	// ErrMailboxFull is returned when the mailbox channel is at capacity
 	// and the caller used a non-blocking send variant.
 	ErrMailboxFull = errors.New("statecraft: mailbox full")

@@ -138,6 +138,68 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 	return svc
 }
 
+// Restore creates a Service whose initial configuration is taken from leaves
+// and ctx rather than the machine's declared initial state. Use this to resume
+// a service after a process restart.
+//
+// Entry actions are NOT re-executed — the provided ctx already reflects them.
+// Timers and invokes are started fresh since they are ephemeral.
+//
+// Returns ErrInvalidCheckpoint if any leaf is unknown or is a compound state.
+func Restore[C any](m *model.Machine[C], leaves []core.StateID, ctx C, opts ...func(*ServiceOptions)) (*Service[C], error) {
+	if len(leaves) == 0 {
+		return nil, fmt.Errorf("%w: leaves must not be empty", core.ErrInvalidCheckpoint)
+	}
+	for _, leaf := range leaves {
+		if !m.Has(leaf) {
+			return nil, fmt.Errorf("%w: unknown state %q", core.ErrInvalidCheckpoint, leaf)
+		}
+		if m.IsCompound(leaf) {
+			return nil, fmt.Errorf("%w: state %q is compound — only leaf states are valid", core.ErrInvalidCheckpoint, leaf)
+		}
+	}
+
+	o := &ServiceOptions{
+		mailboxSize: defaultMailboxSize,
+		clock:       core.System,
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+
+	svc := &Service[C]{
+		machine:     m,
+		leaves:      append([]core.StateID(nil), leaves...),
+		ctx:         ctx,
+		mailbox:     make(chan core.Envelope, o.mailboxSize),
+		done:        make(chan struct{}),
+		cancelFn:    cancel,
+		subs:        newSubscriberSet[C](),
+		scheduler:   newScheduler(o.clock),
+		clock:       o.clock,
+		mailboxSize: o.mailboxSize,
+		invokes:     make(map[core.StateID][]context.CancelFunc),
+	}
+
+	// Restart timers and invokes for every state in the active configuration.
+	// Entry actions are intentionally skipped — the restored context already
+	// reflects them.
+	for _, id := range m.ConfigurationOf(leaves) {
+		svc.startStateTimers(id)
+	}
+	svc.storeSnapshot(core.Init, false)
+
+	svc.status.Store(statusRunning)
+	for _, id := range m.ConfigurationOf(leaves) {
+		svc.doInvokeEntry(id, core.Init)
+	}
+
+	go svc.run(runCtx)
+	return svc, nil
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 // Send enqueues an event for processing. It blocks if the mailbox is full,
@@ -220,6 +282,9 @@ func (s *Service[C]) Err() error {
 // machines this is always the single active state. For parallel machines,
 // use Snapshot().ActiveStates to see all active regions.
 func (s *Service[C]) State() core.StateID { return s.Snapshot().State }
+
+// MachineID returns the ID of the compiled machine this service runs.
+func (s *Service[C]) MachineID() string { return s.machine.ID() }
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
 
@@ -560,8 +625,11 @@ func (s *Service[C]) storeSnapshot(ev core.Event, changed bool) {
 			break
 		}
 	}
+	leaves := make([]core.StateID, len(s.leaves))
+	copy(leaves, s.leaves)
 	s.snap.Store(Snapshot[C]{
 		State:         s.leaves[0],
+		Leaves:        leaves,
 		ActiveStates:  s.machine.ConfigurationOf(s.leaves),
 		PreviousState: s.previousLeaf,
 		Context:       s.ctx,

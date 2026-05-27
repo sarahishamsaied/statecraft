@@ -9,11 +9,18 @@ import (
 // It is safe to read from any goroutine. The generic parameter C mirrors
 // the machine's context type.
 type Snapshot[C any] struct {
-	// State is the active leaf state ID.
+	// State is the first active leaf state ID. For flat and compound machines
+	// this is always the single active state. For parallel machines, use
+	// Leaves for all active regions.
 	State core.StateID
 
+	// Leaves contains all active leaf state IDs — one per parallel region.
+	// For flat and compound machines this is always [State]. Suitable for
+	// passing directly to persist.Restore to recreate a service.
+	Leaves []core.StateID
+
 	// ActiveStates is the full configuration: all states from the outermost
-	// ancestor down to the active leaf, in outermost-first order.
+	// ancestor down to all active leaves, in outermost-first definition order.
 	// For flat machines this is always [State].
 	ActiveStates []core.StateID
 

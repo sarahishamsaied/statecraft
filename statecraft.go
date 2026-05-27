@@ -25,6 +25,7 @@ import (
 	"statecraft/actor"
 	"statecraft/core"
 	"statecraft/model"
+	"statecraft/persist"
 	"statecraft/runtime"
 )
 
@@ -186,3 +187,21 @@ func WithActorStrategy(s actor.SupervisionStrategy, maxRestarts int) actor.Spawn
 
 // InvokeFn[C] starts an async side-effect when a state is entered.
 type InvokeFn[C any] = model.InvokeFn[C]
+
+// ─── Persistence ──────────────────────────────────────────────────────────────
+
+// Checkpoint is the serialised form of a Service's state. Produced by Save,
+// consumed by Restore. Safe to store in any JSON-capable backend.
+type Checkpoint = persist.Checkpoint
+
+// Save serialises the current snapshot of svc to a JSON Checkpoint.
+// The context type C must be JSON-marshallable.
+func Save[C any](svc *runtime.Service[C]) ([]byte, error) {
+	return persist.Save(svc)
+}
+
+// Restore creates a new running Service from a previously saved Checkpoint.
+// Entry actions are not re-executed; timers and invokes restart fresh.
+func Restore[C any](m *model.Machine[C], data []byte, opts ...func(*runtime.ServiceOptions)) (*runtime.Service[C], error) {
+	return persist.Restore(m, data, opts...)
+}
