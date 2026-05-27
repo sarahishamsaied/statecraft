@@ -32,15 +32,15 @@ fmt.Println(svc.State()) // "green"
 
 ## Diagrams
 
-**Traffic light** — flat FSM
+**Traffic light** , flat FSM
 
 ![traffic-light](docs/diagrams/traffic-light.svg)
 
-**Auth flow** — guards, delayed transitions, final state
+**Auth flow** , guards, delayed transitions, final state
 
 ![auth-flow](docs/diagrams/auth-flow.svg)
 
-**Doc editor** — parallel regions, OnDone
+**Doc editor** , parallel regions, OnDone
 
 ![doc-editor](docs/diagrams/doc-editor.svg)
 
