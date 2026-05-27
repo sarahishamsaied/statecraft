@@ -575,3 +575,217 @@ func awaitState[C any](svc *runtime.Service[C], id string) <-chan runtime.Snapsh
 	})
 	return ch
 }
+
+// ─── Hierarchical states ──────────────────────────────────────────────────────
+
+func TestHarness_Hierarchical_InitialEntry(t *testing.T) {
+	type Ctx struct{ Log []string }
+
+	m := model.New[Ctx]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:active")
+				return c
+			}))
+			s.State("idle", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:idle")
+					return c
+				}))
+				s.On("RUN", "running")
+			})
+			s.State("running")
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+
+	h.AssertState(t, "idle")
+	h.AssertIn(t, "active")
+
+	want := []string{"enter:active", "enter:idle"}
+	if got := h.Context().Log; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("entry log = %v, want %v", got, want)
+	}
+}
+
+func TestHarness_Hierarchical_SiblingTransition_DoesNotReenterParent(t *testing.T) {
+	type Ctx struct{ Log []string }
+
+	m := model.New[Ctx]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:active")
+				return c
+			}))
+			s.State("idle", func(s *model.StateBuilder[Ctx]) {
+				s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "exit:idle")
+					return c
+				}))
+				s.On("RUN", "running")
+			})
+			s.State("running", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:running")
+					return c
+				}))
+			})
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.MustTransition(t, core.E("RUN"))
+
+	h.AssertState(t, "running")
+	h.AssertIn(t, "active")
+
+	// active must NOT have been re-entered.
+	want := []string{"enter:active", "exit:idle", "enter:running"}
+	if got := h.Context().Log; len(got) != len(want) {
+		t.Errorf("log = %v, want %v", got, want)
+	} else {
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("log[%d] = %q, want %q", i, got[i], w)
+			}
+		}
+	}
+}
+
+func TestHarness_Hierarchical_EventBubbling(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) {
+			s.State("idle")
+			// CANCEL not handled by any child — bubbles to parent.
+			s.On("CANCEL", "done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "idle")
+
+	h.MustTransition(t, core.E("CANCEL"))
+	h.AssertState(t, "done")
+	h.AssertFinal(t)
+}
+
+func TestHarness_Hierarchical_AssertIn_And_AssertNotIn(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("outer").
+		State("outer", func(s *model.StateBuilder[struct{}]) {
+			s.State("inner")
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+
+	h.AssertIn(t, "outer")
+	h.AssertIn(t, "inner")
+	h.AssertNotIn(t, "nonexistent")
+}
+
+// ─── Parallel states ──────────────────────────────────────────────────────────
+
+func TestHarness_Parallel_InitialEntry(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("A", func(s *model.StateBuilder[struct{}]) {
+				s.State("a1")
+			})
+			s.State("B", func(s *model.StateBuilder[struct{}]) {
+				s.State("b1")
+			})
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+
+	h.AssertLeaves(t, "a1", "b1")
+	h.AssertIn(t, "par")
+	h.AssertIn(t, "A")
+	h.AssertIn(t, "B")
+}
+
+func TestHarness_Parallel_IndependentRegions(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("A", func(s *model.StateBuilder[struct{}]) {
+				s.State("a_idle", func(s *model.StateBuilder[struct{}]) {
+					s.On("RUN_A", "a_running")
+				})
+				s.State("a_running")
+			})
+			s.State("B", func(s *model.StateBuilder[struct{}]) {
+				s.State("b_idle", func(s *model.StateBuilder[struct{}]) {
+					s.On("RUN_B", "b_running")
+				})
+				s.State("b_running")
+			})
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertLeaves(t, "a_idle", "b_idle")
+
+	h.MustTransition(t, core.E("RUN_A"))
+	h.AssertLeaves(t, "a_running", "b_idle")
+	h.AssertNotIn(t, "b_running")
+
+	h.MustTransition(t, core.E("RUN_B"))
+	h.AssertLeaves(t, "a_running", "b_running")
+}
+
+func TestHarness_Parallel_ParentTransitionExitsAllRegions(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("A", func(s *model.StateBuilder[struct{}]) { s.State("a1") })
+			s.State("B", func(s *model.StateBuilder[struct{}]) { s.State("b1") })
+			s.On("DONE", "final")
+		}).
+		State("final", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.MustTransition(t, core.E("DONE"))
+
+	h.AssertState(t, "final")
+	h.AssertFinal(t)
+	h.AssertNotIn(t, "par")
+}
+
+func TestHarness_Parallel_FinalWhenAllRegionsDone(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("A", func(s *model.StateBuilder[struct{}]) {
+				s.State("a_active", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_A", "a_done")
+				})
+				s.State("a_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+			s.State("B", func(s *model.StateBuilder[struct{}]) {
+				s.State("b_active", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_B", "b_done")
+				})
+				s.State("b_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+		}).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertNotFinal(t)
+
+	h.MustTransition(t, core.E("DONE_A"))
+	h.AssertNotFinal(t) // only region A done
+
+	h.MustTransition(t, core.E("DONE_B"))
+	h.AssertFinal(t) // both regions done
+}
