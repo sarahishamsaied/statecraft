@@ -125,6 +125,7 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 		svc.doEntry(id, core.Init)
 		svc.startStateTimers(id)
 	}
+	svc.raiseDoneEvents(initEntry)
 	svc.storeSnapshot(core.Init, false)
 
 	// Set running before starting invokes so that the send callback they
@@ -503,6 +504,9 @@ func (s *Service[C]) applyTransitions(ev core.Event, pending []pendingTrans[C]) 
 		s.internal = append(s.internal, raised...)
 	}
 
+	// ── 6.5. Raise done events for compound/parallel states that just completed ─
+	s.raiseDoneEvents(entryOrder)
+
 	// ── 7. Publish snapshot ────────────────────────────────────────────────
 	s.storeAndNotify(ev, !leavesEqual(s.leaves, prevLeaves))
 }
@@ -612,6 +616,63 @@ func (s *Service[C]) stopStateTimers(id core.StateID) {
 	for _, conf := range s.machine.AfterConfs(id) {
 		s.scheduler.Cancel(conf.TimerID)
 	}
+}
+
+// ─── Done-event helpers ───────────────────────────────────────────────────────
+
+// raiseDoneEvents checks each newly-entered state's compound ancestors and
+// injects a "done.state.X" internal event for any that just completed.
+// Scoping to `entered` (rather than all leaves) ensures done events only fire
+// once per macrostep — when a relevant descendant was actually entered.
+func (s *Service[C]) raiseDoneEvents(entered []core.StateID) {
+	checked := make(map[core.StateID]bool)
+	for _, id := range entered {
+		for cur := id; ; {
+			par, ok := s.machine.Parent(cur)
+			if !ok {
+				break
+			}
+			if checked[par] {
+				break
+			}
+			checked[par] = true
+			if s.compoundIsDone(par) {
+				s.internal = append(s.internal, core.E("done.state."+string(par)))
+			}
+			cur = par
+		}
+	}
+}
+
+// compoundIsDone reports whether compound state id has completed:
+//   - compound OR: the active leaf in its subtree is a final state
+//   - parallel AND: every region contains at least one active final leaf
+func (s *Service[C]) compoundIsDone(id core.StateID) bool {
+	if !s.machine.IsCompound(id) {
+		return false
+	}
+	if s.machine.IsParallel(id) {
+		for _, regionID := range s.machine.Children(id) {
+			regionDone := false
+			for _, leaf := range s.leaves {
+				if (leaf == regionID || s.machine.IsDescendantOf(leaf, regionID)) && s.machine.IsFinal(leaf) {
+					regionDone = true
+					break
+				}
+			}
+			if !regionDone {
+				return false
+			}
+		}
+		return true
+	}
+	// Compound OR: find the active leaf inside this subtree.
+	for _, leaf := range s.leaves {
+		if s.machine.IsDescendantOf(leaf, id) {
+			return s.machine.IsFinal(leaf)
+		}
+	}
+	return false
 }
 
 // ─── Snapshot helpers ─────────────────────────────────────────────────────────

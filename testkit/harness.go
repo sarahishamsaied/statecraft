@@ -62,10 +62,12 @@ func NewHarness[C any](m *model.Machine[C]) *Harness[C] {
 		invokes:   make(map[core.StateID][]context.CancelFunc),
 	}
 	// Enter the full initial configuration outermost-first.
-	for _, id := range h.entryPaths("", h.leaves) {
+	initEntry := h.entryPaths("", h.leaves)
+	for _, id := range initEntry {
 		h.doEntry(id, core.Init)
 		h.startStateTimers(id)
 	}
+	h.raiseDoneEvents(initEntry)
 	h.flush()
 	return h
 }
@@ -433,6 +435,7 @@ func (h *Harness[C]) applyTransitions(ev core.Event, pending []pendingTrans[C]) 
 	}
 
 	h.internal = append(h.internal, ac.Drain()...)
+	h.raiseDoneEvents(entryOrder)
 	h.steps = append(h.steps, Step[C]{
 		Event:   ev,
 		From:    prevLeaves[0],
@@ -485,6 +488,55 @@ func (h *Harness[C]) stopStateTimers(id core.StateID) {
 	for _, conf := range h.machine.AfterConfs(id) {
 		h.scheduler.cancel(conf.TimerID)
 	}
+}
+
+// ─── Done-event helpers ───────────────────────────────────────────────────────
+
+func (h *Harness[C]) raiseDoneEvents(entered []core.StateID) {
+	checked := make(map[core.StateID]bool)
+	for _, id := range entered {
+		for cur := id; ; {
+			par, ok := h.machine.Parent(cur)
+			if !ok {
+				break
+			}
+			if checked[par] {
+				break
+			}
+			checked[par] = true
+			if h.compoundIsDone(par) {
+				h.internal = append(h.internal, core.E("done.state."+string(par)))
+			}
+			cur = par
+		}
+	}
+}
+
+func (h *Harness[C]) compoundIsDone(id core.StateID) bool {
+	if !h.machine.IsCompound(id) {
+		return false
+	}
+	if h.machine.IsParallel(id) {
+		for _, regionID := range h.machine.Children(id) {
+			regionDone := false
+			for _, leaf := range h.leaves {
+				if (leaf == regionID || h.machine.IsDescendantOf(leaf, regionID)) && h.machine.IsFinal(leaf) {
+					regionDone = true
+					break
+				}
+			}
+			if !regionDone {
+				return false
+			}
+		}
+		return true
+	}
+	for _, leaf := range h.leaves {
+		if h.machine.IsDescendantOf(leaf, id) {
+			return h.machine.IsFinal(leaf)
+		}
+	}
+	return false
 }
 
 // ─── Entry path helpers ───────────────────────────────────────────────────────

@@ -202,6 +202,21 @@ func (m *Machine[C]) InitialLeaves() []core.StateID {
 	return m.LeafTargets(m.initial)
 }
 
+// IsDescendantOf reports whether id is a proper descendant of ancestor —
+// i.e. ancestor appears somewhere in id's parent chain.
+func (m *Machine[C]) IsDescendantOf(id, ancestor core.StateID) bool {
+	s := m.states[id]
+	if s == nil {
+		return false
+	}
+	for p := s.parent; p != nil; p = p.parent {
+		if p.id == ancestor {
+			return true
+		}
+	}
+	return false
+}
+
 // LCCA returns the Least Common Compound Ancestor of s1 and s2 — the deepest
 // compound state that is a proper ancestor of both. Returns "" if no compound
 // ancestor exists (both states are in different top-level branches).
@@ -300,10 +315,11 @@ func (m *Machine[C]) ConfigurationOf(leaves []core.StateID) []core.StateID {
 type TransitionInfo struct {
 	From     string
 	To       string
-	Event    string        // "" for after/always transitions
+	Event    string        // "" for after/always transitions; "done" for done transitions
 	Delay    time.Duration // non-zero for after-transitions
 	IsAfter  bool
 	IsAlways bool
+	IsDone   bool // true for OnDone transitions
 	HasGuard bool
 }
 
@@ -323,12 +339,17 @@ func (m *Machine[C]) Transitions() []TransitionInfo {
 				continue
 			}
 			for _, ct := range cts {
-				out = append(out, TransitionInfo{
+				info := TransitionInfo{
 					From:     string(id),
 					To:       string(ct.target),
 					Event:    string(evType),
 					HasGuard: ct.guard != nil,
-				})
+				}
+				if isDoneEvent(evType) {
+					info.IsDone = true
+					info.Event = "done"
+				}
+				out = append(out, info)
 			}
 		}
 		for _, ac := range s.afterConfs {
@@ -354,6 +375,10 @@ func (m *Machine[C]) Transitions() []TransitionInfo {
 
 func isAfterEvent(et core.EventType) bool {
 	return len(et) > 16 && et[:16] == "statecraft.after"
+}
+
+func isDoneEvent(et core.EventType) bool {
+	return len(et) > 11 && et[:11] == "done.state."
 }
 
 // AfterConf describes a single timer-based transition on a state.

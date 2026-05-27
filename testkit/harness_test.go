@@ -789,3 +789,80 @@ func TestHarness_Parallel_FinalWhenAllRegionsDone(t *testing.T) {
 	h.MustTransition(t, core.E("DONE_B"))
 	h.AssertFinal(t) // both regions done
 }
+
+// ─── done events ──────────────────────────────────────────────────────────────
+
+func TestHarness_OnDone_CompoundStateFires(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("wizard").
+		State("wizard", func(s *model.StateBuilder[struct{}]) {
+			s.State("step1", func(s *model.StateBuilder[struct{}]) {
+				s.On("NEXT", "step2")
+			})
+			s.State("step2", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			s.OnDone("done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.AssertIn(t, "wizard")
+	h.AssertIn(t, "step1")
+	h.AssertNotFinal(t)
+
+	h.MustTransition(t, core.E("NEXT"))
+	// OnDone fires automatically: wizard completes → done
+	h.AssertState(t, "done")
+	h.AssertFinal(t)
+}
+
+func TestHarness_OnDone_ParallelStateFires(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("ra", func(s *model.StateBuilder[struct{}]) {
+				s.State("a_go", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_A", "a_done")
+				})
+				s.State("a_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+			s.State("rb", func(s *model.StateBuilder[struct{}]) {
+				s.State("b_go", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_B", "b_done")
+				})
+				s.State("b_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+			s.OnDone("complete")
+		}).
+		State("complete", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	h := testkit.NewHarness(m)
+	h.MustTransition(t, core.E("DONE_A"))
+	h.AssertIn(t, "par")     // still inside parallel
+	h.AssertNotFinal(t)      // region B not done yet
+
+	h.MustTransition(t, core.E("DONE_B"))
+	h.AssertState(t, "complete")
+	h.AssertFinal(t)
+}
+
+func TestHarness_OnDone_Cascades(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("outer").
+		State("outer", func(s *model.StateBuilder[struct{}]) {
+			s.State("inner", func(s *model.StateBuilder[struct{}]) {
+				s.State("leaf", func(s *model.StateBuilder[struct{}]) { s.Final() })
+				s.OnDone("inner_done")
+			})
+			s.State("inner_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			s.OnDone("finished")
+		}).
+		State("finished", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	// Starting in outer/inner/leaf — all three done events cascade immediately.
+	h := testkit.NewHarness(m)
+	h.AssertState(t, "finished")
+	h.AssertFinal(t)
+}

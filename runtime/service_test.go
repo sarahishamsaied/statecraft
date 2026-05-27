@@ -1146,3 +1146,170 @@ func assertState[C any](t *testing.T, ch <-chan runtime.Snapshot[C], want string
 		t.Fatalf("timed out waiting for state %q", want)
 	}
 }
+
+// ─── done events ──────────────────────────────────────────────────────────────
+
+// TestDone_CompoundStateFires verifies that completing a compound state's
+// final child automatically fires and resolves the OnDone transition.
+func TestDone_CompoundStateFires(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("wizard").
+		State("wizard", func(s *model.StateBuilder[struct{}]) {
+			s.State("step1", func(s *model.StateBuilder[struct{}]) {
+				s.On("NEXT", "step2")
+			})
+			s.State("step2", func(s *model.StateBuilder[struct{}]) {
+				s.Final()
+			})
+			s.OnDone("done")
+		}).
+		State("done", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+	if err := svc.Send(core.E("NEXT")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for final state")
+	}
+	snap := svc.Snapshot()
+	if !snap.Is("done") {
+		t.Errorf("state = %q, want done", snap.State)
+	}
+}
+
+// TestDone_ParallelStateFires verifies that a parallel state fires done when
+// ALL regions reach a final state.
+func TestDone_ParallelStateFires(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("regionA", func(s *model.StateBuilder[struct{}]) {
+				s.State("a_active", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_A", "a_final")
+				})
+				s.State("a_final", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+			s.State("regionB", func(s *model.StateBuilder[struct{}]) {
+				s.State("b_active", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_B", "b_final")
+				})
+				s.State("b_final", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+			s.OnDone("complete")
+		}).
+		State("complete", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+
+	if err := svc.Send(core.E("DONE_A")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	// Only region A is done — should NOT have fired done yet.
+	if svc.Snapshot().Is("complete") {
+		t.Fatal("done fired too early — both regions must be final first")
+	}
+
+	if err := svc.Send(core.E("DONE_B")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for final state")
+	}
+	if !svc.Snapshot().Is("complete") {
+		t.Errorf("state = %q, want complete", svc.Snapshot().State)
+	}
+}
+
+// TestDone_Cascades verifies that done events cascade: completing an inner
+// compound state can propagate and complete an outer compound state.
+func TestDone_Cascades(t *testing.T) {
+	// outer → inner → leaf (final) → inner.OnDone → inner_done (final)
+	//                                             → outer.OnDone → finished
+	m := model.New[struct{}]("m").
+		Initial("outer").
+		State("outer", func(s *model.StateBuilder[struct{}]) {
+			s.State("inner", func(s *model.StateBuilder[struct{}]) {
+				s.State("leaf", func(s *model.StateBuilder[struct{}]) { s.Final() })
+				s.OnDone("inner_done")
+			})
+			s.State("inner_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			s.OnDone("finished")
+		}).
+		State("finished", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out — cascading done events did not resolve")
+	}
+	if !svc.Snapshot().Is("finished") {
+		t.Errorf("state = %q, want finished", svc.Snapshot().State)
+	}
+}
+
+// TestDone_OnDoneWithGuard verifies that a guarded OnDone only fires when the
+// guard passes.
+func TestDone_OnDoneWithGuard(t *testing.T) {
+	type Ctx struct{ OK bool }
+
+	m := model.New[Ctx]("m").
+		Initial("flow").
+		State("flow", func(s *model.StateBuilder[Ctx]) {
+			s.State("step", func(s *model.StateBuilder[Ctx]) { s.Final() })
+			s.OnDone("success",
+				model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.OK }),
+			)
+			s.OnDone("failure")
+		}).
+		State("success", func(s *model.StateBuilder[Ctx]) { s.Final() }).
+		State("failure", func(s *model.StateBuilder[Ctx]) { s.Final() }).
+		MustBuild()
+
+	// Guard passes — should go to success.
+	svc1 := runtime.Start(model.New[Ctx]("m").
+		Initial("flow").
+		State("flow", func(s *model.StateBuilder[Ctx]) {
+			s.State("step", func(s *model.StateBuilder[Ctx]) { s.Final() })
+			s.OnDone("success",
+				model.When[Ctx](func(c Ctx, _ core.Event) bool { return c.OK }),
+			)
+			s.OnDone("failure")
+		}).
+		State("success", func(s *model.StateBuilder[Ctx]) { s.Final() }).
+		State("failure", func(s *model.StateBuilder[Ctx]) { s.Final() }).
+		Context(Ctx{OK: true}).
+		MustBuild(),
+	)
+	defer svc1.Stop()
+	time.Sleep(30 * time.Millisecond)
+	if !svc1.Snapshot().Is("success") {
+		t.Errorf("guard=true: state = %q, want success", svc1.Snapshot().State)
+	}
+
+	// Guard fails — should fall through to failure.
+	svc2 := runtime.Start(m)
+	defer svc2.Stop()
+	time.Sleep(30 * time.Millisecond)
+	if !svc2.Snapshot().Is("failure") {
+		t.Errorf("guard=false: state = %q, want failure", svc2.Snapshot().State)
+	}
+}

@@ -213,6 +213,24 @@ func (s *StateBuilder[C]) Initial(id string) *StateBuilder[C] {
 	return s
 }
 
+// OnDone adds a transition that fires when this compound or parallel state
+// completes — i.e. all active leaves within the state are final. For compound
+// OR states this fires when the active child is a final state; for parallel
+// states it fires when every region contains a final active leaf.
+//
+//	s.State("checkout", func(s *model.StateBuilder[C]) {
+//	    s.State("payment", func(s *model.StateBuilder[C]) { s.Final() })
+//	    s.OnDone("confirmed")   // fires when payment is reached
+//	})
+func (s *StateBuilder[C]) OnDone(target string, opts ...TransitionOption[C]) *StateBuilder[C] {
+	return s.On(doneEventType(s.cfg.id), target, opts...)
+}
+
+// doneEventType returns the synthetic event type fired when state id completes.
+func doneEventType(stateID string) string {
+	return "done.state." + stateID
+}
+
 // ─── TransitionOption ────────────────────────────────────────────────────────
 
 // TransitionOption modifies a transition during its declaration.
