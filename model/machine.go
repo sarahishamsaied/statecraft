@@ -20,6 +20,8 @@ type Machine[C any] struct {
 func (m *Machine[C]) ID() string { return m.id }
 
 // InitialState returns the ID of the state the machine starts in.
+// For compound initial states, call LeafTarget(InitialState()) to get the
+// deepest initial child.
 func (m *Machine[C]) InitialState() core.StateID { return m.initial }
 
 // InitialContext returns a copy of the initial context value.
@@ -44,24 +46,55 @@ func (m *Machine[C]) IsFinal(id core.StateID) bool {
 	return ok && s.final
 }
 
-// ResolveTransition finds the first enabled transition for the current state
-// and event. Guards are evaluated in definition order; the first passing
-// transition is returned.
+// IsCompound reports whether the state has child states.
+func (m *Machine[C]) IsCompound(id core.StateID) bool {
+	s, ok := m.states[id]
+	return ok && len(s.children) > 0
+}
+
+// Parent returns the parent state ID. Returns ("", false) for top-level states.
+func (m *Machine[C]) Parent(id core.StateID) (core.StateID, bool) {
+	s, ok := m.states[id]
+	if !ok || s.parent == nil {
+		return "", false
+	}
+	return s.parent.id, true
+}
+
+// ─── Transition resolution ────────────────────────────────────────────────────
+
+// ResolveTransition finds the first enabled transition for the given event,
+// walking up the ancestor chain if the leaf state has no matching handler
+// (event bubbling). Guards are evaluated in definition order.
 //
 // Returns (target, actions, true) on success, ("", nil, false) if no
-// transition matches (the event is silently ignored by the interpreter).
+// transition matches anywhere in the ancestor chain.
 func (m *Machine[C]) ResolveTransition(
 	stateID core.StateID,
 	ctx C,
 	ev core.Event,
 ) (target core.StateID, actions []ActionFn[C], ok bool) {
-	s, exists := m.states[stateID]
-	if !exists {
-		return "", nil, false
+	for s := m.states[stateID]; s != nil; s = s.parent {
+		for _, ct := range s.transitions[ev.Type()] {
+			if ct.guard == nil || ct.guard(ctx, ev) {
+				return ct.target, ct.actions, true
+			}
+		}
 	}
-	for _, ct := range s.transitions[ev.Type()] {
-		if ct.guard == nil || ct.guard(ctx, ev) {
-			return ct.target, ct.actions, true
+	return "", nil, false
+}
+
+// ResolveAlways finds the first enabled automatic (null) transition, walking
+// up the ancestor chain. Evaluated after every step and on initial entry.
+func (m *Machine[C]) ResolveAlways(
+	stateID core.StateID,
+	ctx C,
+) (target core.StateID, actions []ActionFn[C], ok bool) {
+	for s := m.states[stateID]; s != nil; s = s.parent {
+		for _, ct := range s.always {
+			if ct.guard == nil || ct.guard(ctx, AlwaysEvent{}) {
+				return ct.target, ct.actions, true
+			}
 		}
 	}
 	return "", nil, false
@@ -83,6 +116,91 @@ func (m *Machine[C]) ExitActions(id core.StateID) []ActionFn[C] {
 	return nil
 }
 
+// ─── Hierarchical navigation ──────────────────────────────────────────────────
+
+// LeafTarget follows initial children from id until reaching an atomic state.
+// For atomic states, returns id unchanged. Used to find the active leaf when
+// entering a compound state.
+func (m *Machine[C]) LeafTarget(id core.StateID) core.StateID {
+	for {
+		s, ok := m.states[id]
+		if !ok || len(s.children) == 0 {
+			return id
+		}
+		id = s.initial
+	}
+}
+
+// LCCA returns the Least Common Compound Ancestor of s1 and s2 — the deepest
+// compound state that is a proper ancestor of both. Returns "" if no compound
+// ancestor exists (both states are in different top-level branches).
+func (m *Machine[C]) LCCA(s1, s2 core.StateID) core.StateID {
+	// Collect proper ancestors of s1 (not including s1 itself).
+	anc1 := make(map[core.StateID]bool)
+	for s := m.states[s1]; s != nil && s.parent != nil; s = s.parent {
+		anc1[s.parent.id] = true
+	}
+	// Walk up from s2 to find the deepest compound state that is also in anc1.
+	for s := m.states[s2]; s != nil && s.parent != nil; s = s.parent {
+		if anc1[s.parent.id] && len(m.states[s.parent.id].children) > 0 {
+			return s.parent.id
+		}
+	}
+	return "" // no compound common ancestor; use implicit root
+}
+
+// ExitPath returns the states to exit when leaving currentLeaf toward lcca,
+// in innermost-first order (leaf first). Includes currentLeaf; excludes lcca.
+// Pass lcca="" to exit all the way to the top level.
+func (m *Machine[C]) ExitPath(currentLeaf, lcca core.StateID) []core.StateID {
+	var path []core.StateID
+	for id := currentLeaf; id != lcca; {
+		path = append(path, id)
+		s := m.states[id]
+		if s.parent == nil {
+			break
+		}
+		id = s.parent.id
+	}
+	return path
+}
+
+// EntryPath returns the states to enter when going from lcca down to target,
+// in outermost-first order. Excludes lcca; follows initial children if target
+// is compound, stopping at the resulting atomic leaf.
+// Pass lcca="" to enter from the top level.
+func (m *Machine[C]) EntryPath(lcca, target core.StateID) []core.StateID {
+	leaf := m.LeafTarget(target)
+	var path []core.StateID
+	for id := leaf; id != lcca; {
+		path = append(path, id)
+		s := m.states[id]
+		if s.parent == nil {
+			break
+		}
+		id = s.parent.id
+	}
+	// Reverse for outermost-first order.
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path
+}
+
+// Configuration returns the active configuration for the given leaf state:
+// all states from the outermost ancestor down to the leaf, in
+// outermost-first order. For flat machines this is always [leaf].
+func (m *Machine[C]) Configuration(leaf core.StateID) []core.StateID {
+	var path []core.StateID
+	for s := m.states[leaf]; s != nil; s = s.parent {
+		path = append(path, s.id)
+	}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path
+}
+
 // ─── Inspection API (used by viz package) ────────────────────────────────────
 
 // TransitionInfo describes a single transition for visualization purposes.
@@ -102,15 +220,12 @@ func (m *Machine[C]) Transitions() []TransitionInfo {
 	var out []TransitionInfo
 	for _, id := range m.order {
 		s := m.states[id]
-		// Regular transitions, grouped by event type.
-		// We collect in a stable order: iterate over all event types found.
 		seen := make(map[core.EventType]bool)
 		for evType, cts := range s.transitions {
 			if seen[evType] {
 				continue
 			}
 			seen[evType] = true
-			// Skip synthetic after-event types.
 			if isAfterEvent(evType) {
 				continue
 			}
@@ -123,7 +238,6 @@ func (m *Machine[C]) Transitions() []TransitionInfo {
 				})
 			}
 		}
-		// After-transitions.
 		for _, ac := range s.afterConfs {
 			out = append(out, TransitionInfo{
 				From:     string(id),
@@ -133,7 +247,6 @@ func (m *Machine[C]) Transitions() []TransitionInfo {
 				HasGuard: ac.transition.guard != nil,
 			})
 		}
-		// Always transitions.
 		for _, ct := range s.always {
 			out = append(out, TransitionInfo{
 				From:     string(id),
@@ -152,18 +265,12 @@ func isAfterEvent(et core.EventType) bool {
 
 // AfterConf describes a single timer-based transition on a state.
 type AfterConf[C any] struct {
-	// TimerID is a unique identifier scoped to the state, used to start and
-	// cancel the underlying timer.
-	TimerID string
-	// Delay is the duration after state entry before the event fires.
-	Delay time.Duration
-	// EventType is the synthetic event type generated when the timer fires.
-	// It is pre-registered as a transition in the compiled state.
+	TimerID   string
+	Delay     time.Duration
 	EventType core.EventType
 }
 
 // InvokeFns returns the invoke functions registered for a state.
-// The runtime calls each on entry and cancels their context on exit.
 func (m *Machine[C]) InvokeFns(id core.StateID) []InvokeFn[C] {
 	if s, ok := m.states[id]; ok {
 		return s.invokes
@@ -188,28 +295,8 @@ func (m *Machine[C]) AfterConfs(id core.StateID) []AfterConf[C] {
 	return out
 }
 
-// ResolveAlways finds the first enabled automatic transition for the current
-// state. Always transitions are evaluated after every step, in definition order.
-// Returns (target, actions, true) when one matches, ("", nil, false) otherwise.
-func (m *Machine[C]) ResolveAlways(
-	stateID core.StateID,
-	ctx C,
-) (target core.StateID, actions []ActionFn[C], ok bool) {
-	s, exists := m.states[stateID]
-	if !exists {
-		return "", nil, false
-	}
-	for _, ct := range s.always {
-		if ct.guard == nil || ct.guard(ctx, AlwaysEvent{}) {
-			return ct.target, ct.actions, true
-		}
-	}
-	return "", nil, false
-}
-
 // AlwaysEvent is the synthetic event passed to guards and actions in
-// always transitions. It carries no user-visible payload.
-// Guards and actions can detect it via type assertion when needed.
+// always transitions.
 type AlwaysEvent struct{}
 
 func (AlwaysEvent) Type() core.EventType { return core.EventTypeAlways }
@@ -218,9 +305,12 @@ func (AlwaysEvent) Type() core.EventType { return core.EventTypeAlways }
 
 type compiledState[C any] struct {
 	id          core.StateID
+	parent      *compiledState[C]    // nil for top-level states
+	children    []*compiledState[C]  // in definition order; empty for atomic states
+	initial     core.StateID         // initial child (only set when len(children)>0)
 	transitions map[core.EventType][]*compiledTransition[C]
 	afterConfs  []*compiledAfter[C]
-	always      []*compiledTransition[C] // null/automatic transitions
+	always      []*compiledTransition[C]
 	onEntry     []ActionFn[C]
 	onExit      []ActionFn[C]
 	invokes     []InvokeFn[C]

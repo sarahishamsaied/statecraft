@@ -47,7 +47,9 @@ type Service[C any] struct {
 	scheduler *Scheduler
 
 	// ── Active invocations ────────────────────────────────────────────────
-	invokes []context.CancelFunc // cancel funcs for running invocations; owned by run goroutine
+	// keyed by state ID so hierarchical transitions only cancel the invokes
+	// for the states actually being exited, leaving sibling/ancestor invokes intact.
+	invokes map[core.StateID][]context.CancelFunc
 
 	// ── Fault capture ─────────────────────────────────────────────────────
 	panicErr atomic.Value // stores panicVal; non-nil if run goroutine panicked
@@ -95,9 +97,12 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 
 	runCtx, cancel := context.WithCancel(context.Background())
 
+	// Resolve the declared initial state to its deepest leaf.
+	initialLeaf := m.LeafTarget(m.InitialState())
+
 	svc := &Service[C]{
 		machine:     m,
-		state:       m.InitialState(),
+		state:       initialLeaf,
 		ctx:         m.InitialContext(),
 		mailbox:     make(chan core.Envelope, o.mailboxSize),
 		done:        make(chan struct{}),
@@ -106,20 +111,24 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 		scheduler:   newScheduler(o.clock),
 		clock:       o.clock,
 		mailboxSize: o.mailboxSize,
+		invokes:     make(map[core.StateID][]context.CancelFunc),
 	}
 
-	// Perform initial state setup synchronously so that callers using a
-	// MockClock can advance time immediately after Start() returns.
-	// Entry actions, timer registration, and the initial snapshot are all
-	// visible to the caller before the run goroutine starts.
-	svc.doEntry(svc.state, core.Init)
-	svc.startStateTimers(svc.state)
+	// Enter the full initial path (outermost ancestor → leaf), synchronously,
+	// so callers using a MockClock can advance time immediately after Start().
+	initPath := m.EntryPath("", initialLeaf)
+	for _, id := range initPath {
+		svc.doEntry(id, core.Init)
+		svc.startStateTimers(id)
+	}
 	svc.storeSnapshot(core.Init, false)
 
 	// Set running before starting invokes so that the send callback they
 	// receive can call svc.Send() without getting ErrActorStopped.
 	svc.status.Store(statusRunning)
-	svc.doInvokeEntry(svc.state, core.Init)
+	for _, id := range initPath {
+		svc.doInvokeEntry(id, core.Init)
+	}
 
 	go svc.run(runCtx)
 	return svc
@@ -292,41 +301,51 @@ func (s *Service[C]) tryAlways() bool {
 		" has an unguarded always transition that keeps re-entering itself")
 }
 
-// doTransition executes the mechanical steps of any transition type:
-// exit, transition actions, state update, entry, timers, invokes, snapshot.
+// doTransition executes the SCXML macrostep for any transition type.
+// For hierarchical machines it computes the LCCA-based exit and entry sets
+// so only the states between the source and target are touched; shared
+// ancestors remain active with their timers and invokes intact.
 func (s *Service[C]) doTransition(ev core.Event, target core.StateID, tActions []model.ActionFn[C]) {
 	from := s.state
 	ac := &model.ActionContext{}
 
-	// 1. Exit current state.
-	s.doExit(s.state, ev)
+	// Resolve compound targets to their initial leaf.
+	leafTarget := s.machine.LeafTarget(target)
 
-	// 2. Cancel timers and invocations scoped to the exited state.
-	s.stopStateTimers(s.state)
-	s.stopInvokes()
+	// Compute exit and entry sets relative to the LCCA.
+	lcca := s.machine.LCCA(from, leafTarget)
+	exitPath := s.machine.ExitPath(from, lcca)   // innermost → outermost
+	entryPath := s.machine.EntryPath(lcca, leafTarget) // outermost → innermost
 
-	// 3. Execute transition actions.
+	// 1. Exit states (innermost first).
+	for _, id := range exitPath {
+		s.doExit(id, ev)
+		s.stopStateTimers(id)
+		s.stopStateInvokes(id)
+	}
+
+	// 2. Execute transition actions.
 	for _, a := range tActions {
 		s.ctx = a(s.ctx, ev, ac)
 	}
 
-	// 4. Update active state.
+	// 3. Update active leaf state.
 	s.previousState = s.state
-	s.state = target
+	s.state = leafTarget
 
-	// 5. Enter new state.
-	s.doEntry(s.state, ev)
+	// 4. Enter states (outermost first).
+	for _, id := range entryPath {
+		s.doEntry(id, ev)
+		s.startStateTimers(id)
+		s.doInvokeEntry(id, ev)
+	}
 
-	// 6. Start timers and invocations scoped to the entered state.
-	s.startStateTimers(s.state)
-	s.doInvokeEntry(s.state, ev)
-
-	// 7. Inject raised events.
+	// 5. Inject events raised by transition actions.
 	if raised := ac.Drain(); len(raised) > 0 {
 		s.internal = append(s.internal, raised...)
 	}
 
-	// 8. Publish snapshot.
+	// 6. Publish snapshot.
 	s.storeAndNotify(ev, s.state != from)
 }
 
@@ -365,19 +384,30 @@ func (s *Service[C]) doInvokeEntry(id core.StateID, ev core.Event) {
 	fns := s.machine.InvokeFns(id)
 	for _, fn := range fns {
 		invokeCtx, cancel := context.WithCancel(context.Background())
-		s.invokes = append(s.invokes, cancel)
+		s.invokes[id] = append(s.invokes[id], cancel)
 		fn(invokeCtx, s.ctx, ev, func(sendEv core.Event) {
 			_ = s.Send(sendEv) // best-effort: ignore ErrActorStopped on shutdown
 		})
 	}
 }
 
-// stopInvokes cancels all active invocations and resets the slice.
-func (s *Service[C]) stopInvokes() {
-	for _, cancel := range s.invokes {
+// stopStateInvokes cancels invocations scoped to state id only.
+// Used during hierarchical transitions to leave ancestor invokes running.
+func (s *Service[C]) stopStateInvokes(id core.StateID) {
+	for _, cancel := range s.invokes[id] {
 		cancel()
 	}
-	s.invokes = s.invokes[:0]
+	delete(s.invokes, id)
+}
+
+// stopInvokes cancels every active invocation (used on shutdown).
+func (s *Service[C]) stopInvokes() {
+	for id, cancels := range s.invokes {
+		for _, cancel := range cancels {
+			cancel()
+		}
+		delete(s.invokes, id)
+	}
 }
 
 // ─── Timer helpers ────────────────────────────────────────────────────────────
@@ -400,6 +430,7 @@ func (s *Service[C]) stopStateTimers(id core.StateID) {
 func (s *Service[C]) storeSnapshot(ev core.Event, changed bool) {
 	s.snap.Store(Snapshot[C]{
 		State:         s.state,
+		ActiveStates:  s.machine.Configuration(s.state),
 		PreviousState: s.previousState,
 		Context:       s.ctx,
 		Event:         ev,

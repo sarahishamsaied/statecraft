@@ -163,6 +163,32 @@ func (s *StateBuilder[C]) Invoke(fn InvokeFn[C]) *StateBuilder[C] {
 	return s
 }
 
+// State declares a child state inside this compound state.
+// The first child declared is the default initial child unless Initial() is
+// called to override it.
+//
+//	s.State("active", func(s *model.StateBuilder[C]) {
+//	    s.Initial("idle")
+//	    s.State("idle",    func(s *model.StateBuilder[C]) { s.On("START", "running") })
+//	    s.State("running", func(s *model.StateBuilder[C]) { s.On("STOP", "idle") })
+//	    s.On("CANCEL", "cancelled")  // parent handles events not handled by children
+//	})
+func (s *StateBuilder[C]) State(id string, configure ...func(*StateBuilder[C])) *StateBuilder[C] {
+	child := &stateConfig[C]{id: id}
+	if len(configure) > 0 {
+		configure[0](&StateBuilder[C]{cfg: child})
+	}
+	s.cfg.children = append(s.cfg.children, child)
+	return s
+}
+
+// Initial sets the initial child state for this compound state.
+// If not called, the first child declared with State() is the initial child.
+func (s *StateBuilder[C]) Initial(id string) *StateBuilder[C] {
+	s.cfg.initialChild = id
+	return s
+}
+
 // ─── TransitionOption ────────────────────────────────────────────────────────
 
 // TransitionOption modifies a transition during its declaration.

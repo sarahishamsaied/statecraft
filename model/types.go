@@ -15,14 +15,16 @@ type machineConfig[C any] struct {
 }
 
 type stateConfig[C any] struct {
-	id          string
-	final       bool
-	transitions []transitionConfig[C]
-	afterConfs  []afterStateConfig[C]
-	always      []transitionConfig[C] // null/automatic transitions — no event trigger
-	onEntry     []ActionFn[C]
-	onExit      []ActionFn[C]
-	invokes     []InvokeFn[C]
+	id           string
+	final        bool
+	initialChild string           // initial child ID for compound states
+	children     []*stateConfig[C] // ordered by definition
+	transitions  []transitionConfig[C]
+	afterConfs   []afterStateConfig[C]
+	always       []transitionConfig[C] // null/automatic transitions — no event trigger
+	onEntry      []ActionFn[C]
+	onExit       []ActionFn[C]
+	invokes      []InvokeFn[C]
 }
 
 type transitionConfig[C any] struct {

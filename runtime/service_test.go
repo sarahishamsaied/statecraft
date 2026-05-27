@@ -570,6 +570,279 @@ func TestService_Invoke_MultipleInvokes(t *testing.T) {
 	}
 }
 
+// ─── hierarchical statecharts ─────────────────────────────────────────────────
+
+// TestService_Hierarchical_InitialEntry verifies that starting a machine whose
+// initial state is compound enters the full ancestor→leaf path.
+func TestService_Hierarchical_InitialEntry(t *testing.T) {
+	type Ctx struct{ Log []string }
+
+	m := model.New[Ctx]("h").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:active")
+				return c
+			}))
+			s.State("idle", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:idle")
+					return c
+				}))
+				s.On("RUN", "running")
+			})
+			s.State("running")
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	snap := svc.Snapshot()
+	if !snap.Is("idle") {
+		t.Errorf("leaf state = %q, want idle", snap.State)
+	}
+	if !snap.In("active") {
+		t.Error("active should be in configuration")
+	}
+	want := []string{"enter:active", "enter:idle"}
+	if len(snap.Context.Log) != len(want) {
+		t.Fatalf("entry log = %v, want %v", snap.Context.Log, want)
+	}
+	for i, w := range want {
+		if snap.Context.Log[i] != w {
+			t.Errorf("log[%d] = %q, want %q", i, snap.Context.Log[i], w)
+		}
+	}
+}
+
+// TestService_Hierarchical_SiblingTransition verifies that transitioning
+// between sibling states exits and enters only the siblings, not the parent.
+func TestService_Hierarchical_SiblingTransition(t *testing.T) {
+	type Ctx struct{ Log []string }
+
+	m := model.New[Ctx]("h").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:active")
+				return c
+			}))
+			s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "exit:active")
+				return c
+			}))
+			s.State("idle", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:idle")
+					return c
+				}))
+				s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "exit:idle")
+					return c
+				}))
+				s.On("RUN", "running")
+			})
+			s.State("running", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:running")
+					return c
+				}))
+			})
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := awaitState(svc, "running")
+	mustSend(t, svc, core.E("RUN"))
+	assertState(t, ch, "running")
+
+	snap := svc.Snapshot()
+	if !snap.In("active") {
+		t.Error("active should still be in configuration after sibling transition")
+	}
+	// active must NOT have been re-entered.
+	want := []string{"enter:active", "enter:idle", "exit:idle", "enter:running"}
+	if len(snap.Context.Log) != len(want) {
+		t.Fatalf("log = %v, want %v", snap.Context.Log, want)
+	}
+	for i, w := range want {
+		if snap.Context.Log[i] != w {
+			t.Errorf("log[%d] = %q, want %q", i, snap.Context.Log[i], w)
+		}
+	}
+}
+
+// TestService_Hierarchical_EventBubbling verifies that an unhandled event in a
+// child state is handled by the parent.
+func TestService_Hierarchical_EventBubbling(t *testing.T) {
+	m := model.New[struct{}]("h").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) {
+			s.State("idle", func(s *model.StateBuilder[struct{}]) {
+				s.On("INNER", "running")
+			})
+			s.State("running")
+			// CANCEL is not handled by any child; it bubbles up to "active".
+			s.On("CANCEL", "cancelled")
+		}).
+		State("cancelled", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	// CANCEL is not handled by "idle", it must bubble up to "active".
+	ch := waitForFinal(svc)
+	mustSend(t, svc, core.E("CANCEL"))
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out — event bubbling to parent did not fire; state=%q", svc.State())
+	}
+	if !svc.Snapshot().Is("cancelled") {
+		t.Errorf("state = %q, want cancelled", svc.State())
+	}
+}
+
+// TestService_Hierarchical_CrossLevelTransition verifies that transitioning
+// from a nested state to a top-level state correctly exits all intermediate
+// ancestors.
+func TestService_Hierarchical_CrossLevelTransition(t *testing.T) {
+	type Ctx struct{ Log []string }
+
+	m := model.New[Ctx]("h").
+		Initial("outer").
+		State("outer", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:outer")
+				return c
+			}))
+			s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "exit:outer")
+				return c
+			}))
+			s.State("inner", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:inner")
+					return c
+				}))
+				s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "exit:inner")
+					return c
+				}))
+				s.On("ESCAPE", "done")
+			})
+		}).
+		State("done", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:done")
+				return c
+			}))
+			s.Final()
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+	mustSend(t, svc, core.E("ESCAPE"))
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for final state")
+	}
+
+	want := []string{"enter:outer", "enter:inner", "exit:inner", "exit:outer", "enter:done"}
+	log := svc.Snapshot().Context.Log
+	if len(log) != len(want) {
+		t.Fatalf("log = %v, want %v", log, want)
+	}
+	for i, w := range want {
+		if log[i] != w {
+			t.Errorf("log[%d] = %q, want %q", i, log[i], w)
+		}
+	}
+}
+
+// TestService_Hierarchical_ActiveStates verifies Snapshot.ActiveStates and In().
+func TestService_Hierarchical_ActiveStates(t *testing.T) {
+	m := model.New[struct{}]("h").
+		Initial("outer").
+		State("outer", func(s *model.StateBuilder[struct{}]) {
+			s.State("mid", func(s *model.StateBuilder[struct{}]) {
+				s.State("leaf")
+			})
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	snap := svc.Snapshot()
+	if !snap.Is("leaf") {
+		t.Errorf("State = %q, want leaf", snap.State)
+	}
+	for _, id := range []string{"outer", "mid", "leaf"} {
+		if !snap.In(id) {
+			t.Errorf("In(%q) = false, want true", id)
+		}
+	}
+	want := []core.StateID{"outer", "mid", "leaf"}
+	if len(snap.ActiveStates) != len(want) {
+		t.Fatalf("ActiveStates = %v, want %v", snap.ActiveStates, want)
+	}
+	for i, w := range want {
+		if snap.ActiveStates[i] != w {
+			t.Errorf("ActiveStates[%d] = %q, want %q", i, snap.ActiveStates[i], w)
+		}
+	}
+}
+
+// TestService_Hierarchical_InvokeOnlyExitsForExitedState verifies that an
+// invoke on a parent state is NOT cancelled during a sibling transition.
+func TestService_Hierarchical_InvokeOnlyExitsForExitedState(t *testing.T) {
+	var parentCancelled atomic.Int32
+
+	m := model.New[struct{}]("h").
+		Initial("active").
+		State("active", func(s *model.StateBuilder[struct{}]) {
+			s.Invoke(func(ctx context.Context, _ struct{}, _ core.Event, _ func(core.Event)) {
+				go func() {
+					<-ctx.Done()
+					parentCancelled.Add(1)
+				}()
+			})
+			s.State("idle", func(s *model.StateBuilder[struct{}]) {
+				s.On("RUN", "running")
+			})
+			s.State("running", func(s *model.StateBuilder[struct{}]) {
+				s.Final()
+			})
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+	mustSend(t, svc, core.E("RUN"))
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for final state")
+	}
+
+	// Give the goroutine a moment — it should NOT have been cancelled.
+	time.Sleep(30 * time.Millisecond)
+	if parentCancelled.Load() != 0 {
+		t.Error("parent invoke was cancelled during sibling transition — it should not be")
+	}
+}
+
 // ─── test helpers ─────────────────────────────────────────────────────────────
 
 func mustSend(t *testing.T, svc interface{ Send(core.Event) error }, ev core.Event) {

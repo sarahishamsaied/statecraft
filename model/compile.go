@@ -19,36 +19,26 @@ func compile[C any](cfg *machineConfig[C]) (*Machine[C], error) {
 		return nil, fmt.Errorf("%w: call .Initial(stateID) before Build()", core.ErrNoInitialState)
 	}
 
-	// ── Pass 1: collect all declared state IDs and check for duplicates ────
-	knownIDs := make(map[string]struct{}, len(cfg.states))
-	for _, sc := range cfg.states {
-		if sc.id == "" {
-			return nil, fmt.Errorf("%w: state ID must not be empty", core.ErrInvalidMachine)
-		}
-		if _, dup := knownIDs[sc.id]; dup {
-			return nil, fmt.Errorf("%w: %q", core.ErrDuplicateState, sc.id)
-		}
-		knownIDs[sc.id] = struct{}{}
+	// ── Pass 1: collect ALL state IDs (including nested) and check duplicates ──
+	knownIDs := make(map[string]struct{})
+	if err := collectStateIDs(cfg.states, knownIDs); err != nil {
+		return nil, err
 	}
 
-	// ── Validate initial state reference ───────────────────────────────────
+	// Validate initial state reference.
 	if _, ok := knownIDs[cfg.initial]; !ok {
 		return nil, fmt.Errorf("%w: initial state %q not declared",
 			core.ErrUnknownState, cfg.initial)
 	}
 
-	// ── Pass 2: compile each state ─────────────────────────────────────────
-	compiled := make(map[core.StateID]*compiledState[C], len(cfg.states))
-	order := make([]core.StateID, 0, len(cfg.states))
+	// ── Pass 2: compile each state tree (DFS) ─────────────────────────────────
+	compiled := make(map[core.StateID]*compiledState[C], len(knownIDs))
+	order := make([]core.StateID, 0, len(knownIDs))
 
 	for _, sc := range cfg.states {
-		cs, err := compileState(sc, knownIDs)
-		if err != nil {
+		if err := compileTree(sc, nil, knownIDs, compiled, &order); err != nil {
 			return nil, err
 		}
-		id := core.StateID(sc.id)
-		compiled[id] = cs
-		order = append(order, id)
 	}
 
 	return &Machine[C]{
@@ -60,13 +50,78 @@ func compile[C any](cfg *machineConfig[C]) (*Machine[C], error) {
 	}, nil
 }
 
-func compileState[C any](
+// collectStateIDs recursively collects all state IDs and checks for duplicates.
+func collectStateIDs[C any](states []*stateConfig[C], known map[string]struct{}) error {
+	for _, sc := range states {
+		if sc.id == "" {
+			return fmt.Errorf("%w: state ID must not be empty", core.ErrInvalidMachine)
+		}
+		if _, dup := known[sc.id]; dup {
+			return fmt.Errorf("%w: %q", core.ErrDuplicateState, sc.id)
+		}
+		known[sc.id] = struct{}{}
+		if err := collectStateIDs(sc.children, known); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// compileTree compiles sc and all its descendants into compiled/order.
+// parent is nil for top-level states.
+func compileTree[C any](
 	sc *stateConfig[C],
+	parent *compiledState[C],
+	knownIDs map[string]struct{},
+	compiled map[core.StateID]*compiledState[C],
+	order *[]core.StateID,
+) error {
+	cs, err := compileNode(sc, parent, knownIDs)
+	if err != nil {
+		return err
+	}
+	compiled[cs.id] = cs
+	*order = append(*order, cs.id)
+
+	for _, child := range sc.children {
+		if err := compileTree(child, cs, knownIDs, compiled, order); err != nil {
+			return err
+		}
+		cs.children = append(cs.children, compiled[core.StateID(child.id)])
+	}
+
+	// Set initial child after all children are compiled.
+	if len(cs.children) > 0 {
+		if sc.initialChild != "" {
+			found := false
+			for _, c := range cs.children {
+				if string(c.id) == sc.initialChild {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: Initial(%q) is not a direct child of state %q",
+					core.ErrInvalidMachine, sc.initialChild, sc.id)
+			}
+			cs.initial = core.StateID(sc.initialChild)
+		} else {
+			cs.initial = cs.children[0].id // default: first declared child
+		}
+	}
+
+	return nil
+}
+
+// compileNode compiles a single state node (no children) into a compiledState.
+func compileNode[C any](
+	sc *stateConfig[C],
+	parent *compiledState[C],
 	knownIDs map[string]struct{},
 ) (*compiledState[C], error) {
-
 	cs := &compiledState[C]{
 		id:          core.StateID(sc.id),
+		parent:      parent,
 		transitions: make(map[core.EventType][]*compiledTransition[C]),
 		onEntry:     sc.onEntry,
 		onExit:      sc.onExit,
@@ -94,9 +149,6 @@ func compileState[C any](
 	}
 
 	// ── After-transitions ───────────────────────────────────────────────────
-	// Each After(d, target) gets a unique synthetic event type so that the
-	// timer callback can trigger it via the normal transition resolution path
-	// without any special-casing in the interpreter.
 	for i, asc := range sc.afterConfs {
 		if asc.delay <= 0 {
 			return nil, fmt.Errorf("%w: after-transition %d in state %q must have positive delay",
@@ -125,15 +177,10 @@ func compileState[C any](
 			transition: ct,
 		}
 		cs.afterConfs = append(cs.afterConfs, after)
-
-		// Register as a normal transition so ResolveTransition finds it.
 		cs.transitions[evType] = append(cs.transitions[evType], ct)
 	}
 
 	// ── Always transitions ──────────────────────────────────────────────────
-	// Compile-time rule: a guardless always transition that targets the same
-	// state it is declared on creates an unconditional infinite loop.
-	// We detect and reject it here rather than panicking at runtime.
 	for i, tc := range sc.always {
 		if tc.target == "" {
 			return nil, fmt.Errorf("%w: always-transition %d in state %q has no target",
@@ -160,7 +207,6 @@ func compileState[C any](
 }
 
 // afterEventType returns the synthetic EventType for a given timer ID.
-// The prefix ensures it can never collide with user-defined event names.
 func afterEventType(timerID string) core.EventType {
 	return core.EventType("statecraft.after." + timerID)
 }
