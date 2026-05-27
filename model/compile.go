@@ -92,7 +92,18 @@ func compileTree[C any](
 
 	// Set initial child after all children are compiled.
 	if len(cs.children) > 0 {
-		if sc.initialChild != "" {
+		if sc.parallel {
+			// Parallel states must have ≥2 regions and cannot nominate a single
+			// initial child — all children are entered simultaneously.
+			if len(cs.children) < 2 {
+				return fmt.Errorf("%w: parallel state %q must have at least 2 regions",
+					core.ErrInvalidMachine, sc.id)
+			}
+			if sc.initialChild != "" {
+				return fmt.Errorf("%w: parallel state %q cannot use Initial() — all regions start simultaneously",
+					core.ErrInvalidMachine, sc.id)
+			}
+		} else if sc.initialChild != "" {
 			found := false
 			for _, c := range cs.children {
 				if string(c.id) == sc.initialChild {
@@ -105,7 +116,7 @@ func compileTree[C any](
 					core.ErrInvalidMachine, sc.initialChild, sc.id)
 			}
 			cs.initial = core.StateID(sc.initialChild)
-		} else {
+		} else if !sc.parallel {
 			cs.initial = cs.children[0].id // default: first declared child
 		}
 	}
@@ -122,6 +133,7 @@ func compileNode[C any](
 	cs := &compiledState[C]{
 		id:          core.StateID(sc.id),
 		parent:      parent,
+		parallel:    sc.parallel,
 		transitions: make(map[core.EventType][]*compiledTransition[C]),
 		onEntry:     sc.onEntry,
 		onExit:      sc.onExit,

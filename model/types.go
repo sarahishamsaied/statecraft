@@ -17,7 +17,8 @@ type machineConfig[C any] struct {
 type stateConfig[C any] struct {
 	id           string
 	final        bool
-	initialChild string           // initial child ID for compound states
+	parallel     bool             // AND-node: all children active simultaneously
+	initialChild string           // initial child ID for compound OR states
 	children     []*stateConfig[C] // ordered by definition
 	transitions  []transitionConfig[C]
 	afterConfs   []afterStateConfig[C]

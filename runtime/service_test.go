@@ -843,6 +843,253 @@ func TestService_Hierarchical_InvokeOnlyExitsForExitedState(t *testing.T) {
 	}
 }
 
+// ─── parallel states ──────────────────────────────────────────────────────────
+
+// parallelFormMachine is a reusable fixture: two independent field regions.
+//
+//	form (parallel)
+//	  ├─ field1:  pristine ──EDIT──► dirty
+//	  └─ field2:  pristine ──EDIT──► dirty
+//	  └─ (on SUBMIT) ──► submitted
+func parallelFormMachine() *model.Machine[struct{}] {
+	return model.New[struct{}]("form").
+		Initial("form").
+		Parallel("form", func(s *model.StateBuilder[struct{}]) {
+			s.State("field1", func(s *model.StateBuilder[struct{}]) {
+				s.State("f1pristine", func(s *model.StateBuilder[struct{}]) {
+					s.On("EDIT1", "f1dirty")
+				})
+				s.State("f1dirty")
+			})
+			s.State("field2", func(s *model.StateBuilder[struct{}]) {
+				s.State("f2pristine", func(s *model.StateBuilder[struct{}]) {
+					s.On("EDIT2", "f2dirty")
+				})
+				s.State("f2dirty")
+			})
+			s.On("SUBMIT", "submitted")
+		}).
+		State("submitted", func(s *model.StateBuilder[struct{}]) { s.Final() }).
+		MustBuild()
+}
+
+// TestService_Parallel_InitialEntry verifies that starting a machine with a
+// parallel state enters all regions simultaneously.
+func TestService_Parallel_InitialEntry(t *testing.T) {
+	svc := runtime.Start(parallelFormMachine())
+	defer svc.Stop()
+
+	snap := svc.Snapshot()
+	for _, want := range []string{"form", "field1", "f1pristine", "field2", "f2pristine"} {
+		if !snap.In(want) {
+			t.Errorf("In(%q) = false, want true; ActiveStates=%v", want, snap.ActiveStates)
+		}
+	}
+}
+
+// TestService_Parallel_IndependentRegionTransitions verifies that an event
+// handled in one region does not affect the other region.
+func TestService_Parallel_IndependentRegionTransitions(t *testing.T) {
+	svc := runtime.Start(parallelFormMachine())
+	defer svc.Stop()
+
+	ch := awaitState(svc, "f1dirty")
+	mustSend(t, svc, core.E("EDIT1"))
+	assertState(t, ch, "f1dirty")
+
+	snap := svc.Snapshot()
+	if !snap.In("f1dirty") {
+		t.Error("field1 region should be in f1dirty")
+	}
+	// field2 region must be untouched.
+	if !snap.In("f2pristine") {
+		t.Errorf("field2 region should still be f2pristine; ActiveStates=%v", snap.ActiveStates)
+	}
+	if snap.In("f2dirty") {
+		t.Error("field2 region should NOT be f2dirty")
+	}
+}
+
+// TestService_Parallel_BothRegionsTransition verifies that two independent
+// events each advance their own region.
+func TestService_Parallel_BothRegionsTransition(t *testing.T) {
+	svc := runtime.Start(parallelFormMachine())
+	defer svc.Stop()
+
+	mustSend(t, svc, core.E("EDIT1"))
+	time.Sleep(20 * time.Millisecond)
+	mustSend(t, svc, core.E("EDIT2"))
+	time.Sleep(20 * time.Millisecond)
+
+	snap := svc.Snapshot()
+	for _, want := range []string{"form", "field1", "f1dirty", "field2", "f2dirty"} {
+		if !snap.In(want) {
+			t.Errorf("In(%q) = false; ActiveStates=%v", want, snap.ActiveStates)
+		}
+	}
+}
+
+// TestService_Parallel_ParentTransitionExitsAllRegions verifies that a
+// transition on the parallel state itself exits all regions at once.
+func TestService_Parallel_ParentTransitionExitsAllRegions(t *testing.T) {
+	svc := runtime.Start(parallelFormMachine())
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+	mustSend(t, svc, core.E("SUBMIT"))
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for final state after SUBMIT")
+	}
+
+	snap := svc.Snapshot()
+	if !snap.Is("submitted") {
+		t.Errorf("State = %q, want submitted", snap.State)
+	}
+	// No region states should remain active.
+	for _, gone := range []string{"form", "field1", "field2", "f1pristine", "f2pristine"} {
+		if snap.In(gone) {
+			t.Errorf("In(%q) = true after exiting parallel state; ActiveStates=%v", gone, snap.ActiveStates)
+		}
+	}
+}
+
+// TestService_Parallel_EntryExitOrder verifies the correct entry/exit order
+// when entering and leaving a parallel state.
+func TestService_Parallel_EntryExitOrder(t *testing.T) {
+	type Ctx struct{ Log []string }
+
+	m := model.New[Ctx]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:par")
+				return c
+			}))
+			s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "exit:par")
+				return c
+			}))
+			s.State("A", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:A")
+					return c
+				}))
+				s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "exit:A")
+					return c
+				}))
+				s.State("A1", func(s *model.StateBuilder[Ctx]) {
+					s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+						c.Log = append(c.Log, "enter:A1")
+						return c
+					}))
+				})
+			})
+			s.State("B", func(s *model.StateBuilder[Ctx]) {
+				s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "enter:B")
+					return c
+				}))
+				s.Exit(model.Assign(func(c Ctx, _ core.Event) Ctx {
+					c.Log = append(c.Log, "exit:B")
+					return c
+				}))
+				s.State("B1", func(s *model.StateBuilder[Ctx]) {
+					s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+						c.Log = append(c.Log, "enter:B1")
+						return c
+					}))
+				})
+			})
+			s.On("DONE", "final")
+		}).
+		State("final", func(s *model.StateBuilder[Ctx]) {
+			s.Entry(model.Assign(func(c Ctx, _ core.Event) Ctx {
+				c.Log = append(c.Log, "enter:final")
+				return c
+			}))
+			s.Final()
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	ch := waitForFinal(svc)
+	mustSend(t, svc, core.E("DONE"))
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+
+	log := svc.Snapshot().Context.Log
+	// Entry: par → A → A1 → B → B1 (parallel: par entered once, then each region)
+	// Exit:  A1 (implicit from exiting A) then exit:A, B1 (implicit) then exit:B, exit:par
+	// We only have explicit entry/exit logs on par, A, B (leaves A1/B1 only have entry).
+	wantEntry := []string{"enter:par", "enter:A", "enter:A1", "enter:B", "enter:B1"}
+	wantExit := []string{"exit:A", "exit:B", "exit:par"}
+	wantTail := []string{"enter:final"}
+
+	want := append(append(wantEntry, wantExit...), wantTail...)
+	if len(log) != len(want) {
+		t.Fatalf("log = %v\nwant %v", log, want)
+	}
+	for i, w := range want {
+		if log[i] != w {
+			t.Errorf("log[%d] = %q, want %q", i, log[i], w)
+		}
+	}
+}
+
+// TestService_Parallel_FinalWhenAllRegionsDone verifies that Snapshot.Final
+// is true only when every region's active leaf is a final state.
+func TestService_Parallel_FinalWhenAllRegionsDone(t *testing.T) {
+	m := model.New[struct{}]("m").
+		Initial("par").
+		Parallel("par", func(s *model.StateBuilder[struct{}]) {
+			s.State("A", func(s *model.StateBuilder[struct{}]) {
+				s.State("a_active", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_A", "a_done")
+				})
+				s.State("a_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+			s.State("B", func(s *model.StateBuilder[struct{}]) {
+				s.State("b_active", func(s *model.StateBuilder[struct{}]) {
+					s.On("DONE_B", "b_done")
+				})
+				s.State("b_done", func(s *model.StateBuilder[struct{}]) { s.Final() })
+			})
+		}).
+		MustBuild()
+
+	svc := runtime.Start(m)
+	defer svc.Stop()
+
+	if svc.Snapshot().Final {
+		t.Error("Final should be false initially")
+	}
+
+	mustSend(t, svc, core.E("DONE_A"))
+	time.Sleep(20 * time.Millisecond)
+	if svc.Snapshot().Final {
+		t.Error("Final should be false when only region A is done")
+	}
+
+	ch := waitForFinal(svc)
+	mustSend(t, svc, core.E("DONE_B"))
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for both regions to be final")
+	}
+	if !svc.Snapshot().Final {
+		t.Error("Final should be true when all regions are done")
+	}
+}
+
 // ─── test helpers ─────────────────────────────────────────────────────────────
 
 func mustSend(t *testing.T, svc interface{ Send(core.Event) error }, ev core.Event) {

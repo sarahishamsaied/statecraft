@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sort"
 	"statecraft/core"
 	"statecraft/model"
 	"sync/atomic"
@@ -28,10 +29,12 @@ type Service[C any] struct {
 	machine *model.Machine[C]
 
 	// ── Interpreter state (owned by the run goroutine) ────────────────────
-	state         core.StateID
-	previousState core.StateID // last state before the most recent transition
-	ctx           C
-	internal      []core.Event // internal queue — drained before the mailbox
+	// leaves holds all active leaf states: exactly one entry for flat/compound
+	// machines, one per region for parallel machines.
+	leaves       []core.StateID
+	previousLeaf core.StateID // leaves[0] before the most recent transition
+	ctx          C
+	internal     []core.Event // internal queue — drained before the mailbox
 
 	// ── Concurrency primitives ────────────────────────────────────────────
 	mailbox   chan core.Envelope   // external event channel
@@ -97,12 +100,13 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 
 	runCtx, cancel := context.WithCancel(context.Background())
 
-	// Resolve the declared initial state to its deepest leaf.
-	initialLeaf := m.LeafTarget(m.InitialState())
+	// Resolve the declared initial state to all active initial leaves
+	// (one for flat/compound machines, one per region for parallel).
+	initialLeaves := m.InitialLeaves()
 
 	svc := &Service[C]{
 		machine:     m,
-		state:       initialLeaf,
+		leaves:      initialLeaves,
 		ctx:         m.InitialContext(),
 		mailbox:     make(chan core.Envelope, o.mailboxSize),
 		done:        make(chan struct{}),
@@ -114,10 +118,10 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 		invokes:     make(map[core.StateID][]context.CancelFunc),
 	}
 
-	// Enter the full initial path (outermost ancestor → leaf), synchronously,
-	// so callers using a MockClock can advance time immediately after Start().
-	initPath := m.EntryPath("", initialLeaf)
-	for _, id := range initPath {
+	// Enter the full initial configuration: collect the union of entry paths
+	// for all initial leaves, deduplicated and in definition order.
+	initEntry := svc.unifiedEntryPaths("", initialLeaves)
+	for _, id := range initEntry {
 		svc.doEntry(id, core.Init)
 		svc.startStateTimers(id)
 	}
@@ -126,7 +130,7 @@ func Start[C any](m *model.Machine[C], opts ...func(*ServiceOptions)) *Service[C
 	// Set running before starting invokes so that the send callback they
 	// receive can call svc.Send() without getting ErrActorStopped.
 	svc.status.Store(statusRunning)
-	for _, id := range initPath {
+	for _, id := range initEntry {
 		svc.doInvokeEntry(id, core.Init)
 	}
 
@@ -212,8 +216,9 @@ func (s *Service[C]) Err() error {
 	return nil
 }
 
-// State returns the currently active state ID.
-// Sugar for s.Snapshot().State.
+// State returns the first active leaf state ID. For flat and compound
+// machines this is always the single active state. For parallel machines,
+// use Snapshot().ActiveStates to see all active regions.
 func (s *Service[C]) State() core.StateID { return s.Snapshot().State }
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
@@ -267,86 +272,205 @@ func (s *Service[C]) run(ctx context.Context) {
 	}
 }
 
-// step processes a single event: resolve transition → exit → transition
-// actions → update state → entry → timers → notify.
-func (s *Service[C]) step(ev core.Event) {
-	target, tActions, ok := s.machine.ResolveTransition(s.state, s.ctx, ev)
-	if !ok {
-		// No enabled transition — event is silently ignored.
-		// Subscribers are NOT notified (nothing changed).
-		return
-	}
-	s.doTransition(ev, target, tActions)
+// pendingTrans is an enabled transition collected during step().
+type pendingTrans[C any] struct {
+	source  core.StateID
+	target  core.StateID
+	actions []model.ActionFn[C]
 }
 
-// tryAlways evaluates always transitions for the current state.
-// Returns true if one fired (caller should re-check internal queue).
-// Panics if always transitions loop more than maxAlwaysIter times without
-// an external event — indicates a missing guard.
+// step collects enabled transitions from every active leaf and applies them
+// in a single SCXML macrostep. For non-parallel machines this is always
+// zero or one transitions; for parallel machines each region contributes
+// independently.
+func (s *Service[C]) step(ev core.Event) {
+	var pending []pendingTrans[C]
+	covered := make(map[core.StateID]bool)
+	for _, leaf := range s.leaves {
+		if covered[leaf] {
+			continue
+		}
+		target, actions, ok := s.machine.ResolveTransition(leaf, s.ctx, ev)
+		if !ok {
+			continue
+		}
+		pending = append(pending, pendingTrans[C]{leaf, target, actions})
+		covered[leaf] = true
+	}
+	if len(pending) == 0 {
+		return
+	}
+	s.applyTransitions(ev, pending)
+}
+
+// tryAlways evaluates always transitions for every active leaf.
+// Returns true if any fired (caller should re-check internal queue).
+// Panics after maxAlwaysIter iterations to catch infinite always loops.
 func (s *Service[C]) tryAlways() bool {
 	const maxAlwaysIter = 1000
 	for range maxAlwaysIter {
-		target, tActions, ok := s.machine.ResolveAlways(s.state, s.ctx)
-		if !ok {
+		var pending []pendingTrans[C]
+		covered := make(map[core.StateID]bool)
+		for _, leaf := range s.leaves {
+			if covered[leaf] {
+				continue
+			}
+			target, actions, ok := s.machine.ResolveAlways(leaf, s.ctx)
+			if !ok {
+				continue
+			}
+			pending = append(pending, pendingTrans[C]{leaf, target, actions})
+			covered[leaf] = true
+		}
+		if len(pending) == 0 {
 			return false
 		}
-		s.doTransition(model.AlwaysEvent{}, target, tActions)
-		// If internal events were raised, stop here — the main loop will
-		// drain them before checking always again.
+		s.applyTransitions(model.AlwaysEvent{}, pending)
 		if len(s.internal) > 0 {
 			return true
 		}
 	}
-	panic("statecraft: always-transition loop — " + string(s.state) +
+	panic("statecraft: always-transition loop — " + string(s.leaves[0]) +
 		" has an unguarded always transition that keeps re-entering itself")
 }
 
-// doTransition executes the SCXML macrostep for any transition type.
-// For hierarchical machines it computes the LCCA-based exit and entry sets
-// so only the states between the source and target are touched; shared
-// ancestors remain active with their timers and invokes intact.
-func (s *Service[C]) doTransition(ev core.Event, target core.StateID, tActions []model.ActionFn[C]) {
-	from := s.state
+// applyTransitions executes one SCXML macrostep for one or more enabled
+// transitions. Computes the unified exit/entry sets relative to each
+// transition's LCCA so shared ancestors are never re-entered.
+func (s *Service[C]) applyTransitions(ev core.Event, pending []pendingTrans[C]) {
+	prevLeaves := append([]core.StateID(nil), s.leaves...)
 	ac := &model.ActionContext{}
 
-	// Resolve compound targets to their initial leaf.
-	leafTarget := s.machine.LeafTarget(target)
+	// ── Per-transition metadata ────────────────────────────────────────────
+	type transInfo struct {
+		source      core.StateID
+		leafTargets []core.StateID // one for atomic/OR, many for parallel
+		lcca        core.StateID
+		exitPath    []core.StateID   // innermost → outermost
+		entryPaths  [][]core.StateID // one path per leaf target
+	}
+	infos := make([]transInfo, len(pending))
+	for i, p := range pending {
+		lt := s.machine.LeafTargets(p.target)
+		// Use the first leaf target for LCCA (they're always under the same parent).
+		lcca := s.machine.LCCA(p.source, lt[0])
+		exitPath := s.machine.ExitPath(p.source, lcca)
+		entryPaths := make([][]core.StateID, len(lt))
+		for j, leafTarget := range lt {
+			entryPaths[j] = s.machine.EntryPath(lcca, leafTarget)
+		}
+		infos[i] = transInfo{p.source, lt, lcca, exitPath, entryPaths}
+	}
 
-	// Compute exit and entry sets relative to the LCCA.
-	lcca := s.machine.LCCA(from, leafTarget)
-	exitPath := s.machine.ExitPath(from, lcca)   // innermost → outermost
-	entryPath := s.machine.EntryPath(lcca, leafTarget) // outermost → innermost
+	// ── Unified exit set (innermost first, deduplicated) ──────────────────
+	// Collect all states to exit across all transitions, then sort by depth
+	// descending so that shared ancestors (e.g. a parallel state exited by
+	// all regions) are always exited after all their descendants.
+	exitSeen := make(map[core.StateID]bool)
+	var exitOrder []core.StateID
+	for _, info := range infos {
+		for _, id := range info.exitPath {
+			if !exitSeen[id] {
+				exitSeen[id] = true
+				exitOrder = append(exitOrder, id)
+			}
+		}
+	}
+	sort.SliceStable(exitOrder, func(i, j int) bool {
+		return s.machine.Depth(exitOrder[i]) > s.machine.Depth(exitOrder[j])
+	})
 
-	// 1. Exit states (innermost first).
-	for _, id := range exitPath {
+	// ── 1. Exit states ─────────────────────────────────────────────────────
+	for _, id := range exitOrder {
 		s.doExit(id, ev)
 		s.stopStateTimers(id)
 		s.stopStateInvokes(id)
 	}
 
-	// 2. Execute transition actions.
-	for _, a := range tActions {
-		s.ctx = a(s.ctx, ev, ac)
+	// ── 2. Execute all transition actions ──────────────────────────────────
+	for _, p := range pending {
+		for _, a := range p.actions {
+			s.ctx = a(s.ctx, ev, ac)
+		}
 	}
 
-	// 3. Update active leaf state.
-	s.previousState = s.state
-	s.state = leafTarget
+	// ── 3. Compute new leaf set ─────────────────────────────────────────────
+	// Replace each exited leaf with its new targets in-place so that region
+	// ordering is preserved (leaves[0] always tracks the first region).
+	sourceToInfo := make(map[core.StateID]*transInfo, len(infos))
+	for i := range infos {
+		sourceToInfo[infos[i].source] = &infos[i]
+	}
+	newLeaves := make([]core.StateID, 0, len(s.leaves))
+	for _, leaf := range s.leaves {
+		if info := sourceToInfo[leaf]; info != nil {
+			newLeaves = append(newLeaves, info.leafTargets...)
+		} else {
+			newLeaves = append(newLeaves, leaf)
+		}
+	}
+	s.previousLeaf = prevLeaves[0]
+	s.leaves = newLeaves
 
-	// 4. Enter states (outermost first).
-	for _, id := range entryPath {
+	// ── 4. Unified entry set (outermost first, deduplicated) ──────────────
+	entrySeen := make(map[core.StateID]bool)
+	var entryOrder []core.StateID
+	for _, info := range infos {
+		for _, ep := range info.entryPaths {
+			for _, id := range ep {
+				if !entrySeen[id] {
+					entrySeen[id] = true
+					entryOrder = append(entryOrder, id)
+				}
+			}
+		}
+	}
+
+	// ── 5. Enter states ────────────────────────────────────────────────────
+	for _, id := range entryOrder {
 		s.doEntry(id, ev)
 		s.startStateTimers(id)
 		s.doInvokeEntry(id, ev)
 	}
 
-	// 5. Inject events raised by transition actions.
+	// ── 6. Inject events raised by transition actions ─────────────────────
 	if raised := ac.Drain(); len(raised) > 0 {
 		s.internal = append(s.internal, raised...)
 	}
 
-	// 6. Publish snapshot.
-	s.storeAndNotify(ev, s.state != from)
+	// ── 7. Publish snapshot ────────────────────────────────────────────────
+	s.storeAndNotify(ev, !leavesEqual(s.leaves, prevLeaves))
+}
+
+func leavesEqual(a, b []core.StateID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ─── Path helpers ─────────────────────────────────────────────────────────────
+
+// unifiedEntryPaths returns the deduplicated, outermost-first list of states
+// to enter when starting from lcca toward a set of leaf targets.
+// Used for initial entry and for entering parallel-state targets.
+func (s *Service[C]) unifiedEntryPaths(lcca core.StateID, leaves []core.StateID) []core.StateID {
+	seen := make(map[core.StateID]bool)
+	var result []core.StateID
+	for _, leaf := range leaves {
+		for _, id := range s.machine.EntryPath(lcca, leaf) {
+			if !seen[id] {
+				seen[id] = true
+				result = append(result, id)
+			}
+		}
+	}
+	return result
 }
 
 // ─── Lifecycle helpers ────────────────────────────────────────────────────────
@@ -428,14 +552,22 @@ func (s *Service[C]) stopStateTimers(id core.StateID) {
 // ─── Snapshot helpers ─────────────────────────────────────────────────────────
 
 func (s *Service[C]) storeSnapshot(ev core.Event, changed bool) {
+	// Final = true only when ALL active leaves are in final states.
+	allFinal := len(s.leaves) > 0
+	for _, leaf := range s.leaves {
+		if !s.machine.IsFinal(leaf) {
+			allFinal = false
+			break
+		}
+	}
 	s.snap.Store(Snapshot[C]{
-		State:         s.state,
-		ActiveStates:  s.machine.Configuration(s.state),
-		PreviousState: s.previousState,
+		State:         s.leaves[0],
+		ActiveStates:  s.machine.ConfigurationOf(s.leaves),
+		PreviousState: s.previousLeaf,
 		Context:       s.ctx,
 		Event:         ev,
 		Changed:       changed,
-		Final:         s.machine.IsFinal(s.state),
+		Final:         allFinal,
 		At:            time.Now(),
 	})
 }

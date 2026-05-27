@@ -46,10 +46,26 @@ func (m *Machine[C]) IsFinal(id core.StateID) bool {
 	return ok && s.final
 }
 
-// IsCompound reports whether the state has child states.
+// IsCompound reports whether the state has child states (OR or AND).
 func (m *Machine[C]) IsCompound(id core.StateID) bool {
 	s, ok := m.states[id]
 	return ok && len(s.children) > 0
+}
+
+// IsParallel reports whether the state is a parallel (AND) state.
+func (m *Machine[C]) IsParallel(id core.StateID) bool {
+	s, ok := m.states[id]
+	return ok && s.parallel
+}
+
+// Depth returns the nesting depth of a state: 0 for top-level states,
+// 1 for their direct children, etc. Used to sort exit sets innermost-first.
+func (m *Machine[C]) Depth(id core.StateID) int {
+	depth := 0
+	for s := m.states[id]; s != nil && s.parent != nil; s = s.parent {
+		depth++
+	}
+	return depth
 }
 
 // Parent returns the parent state ID. Returns ("", false) for top-level states.
@@ -59,6 +75,30 @@ func (m *Machine[C]) Parent(id core.StateID) (core.StateID, bool) {
 		return "", false
 	}
 	return s.parent.id, true
+}
+
+// Children returns the direct child state IDs in definition order.
+// Returns nil for atomic states.
+func (m *Machine[C]) Children(id core.StateID) []core.StateID {
+	s, ok := m.states[id]
+	if !ok || len(s.children) == 0 {
+		return nil
+	}
+	out := make([]core.StateID, len(s.children))
+	for i, c := range s.children {
+		out[i] = c.id
+	}
+	return out
+}
+
+// InitialChild returns the initial child of a compound OR state.
+// Returns ("", false) for atomic states and parallel states.
+func (m *Machine[C]) InitialChild(id core.StateID) (core.StateID, bool) {
+	s, ok := m.states[id]
+	if !ok || len(s.children) == 0 || s.parallel {
+		return "", false
+	}
+	return s.initial, true
 }
 
 // ─── Transition resolution ────────────────────────────────────────────────────
@@ -119,16 +159,47 @@ func (m *Machine[C]) ExitActions(id core.StateID) []ActionFn[C] {
 // ─── Hierarchical navigation ──────────────────────────────────────────────────
 
 // LeafTarget follows initial children from id until reaching an atomic state.
-// For atomic states, returns id unchanged. Used to find the active leaf when
-// entering a compound state.
+// For atomic states, returns id unchanged. For compound OR states, follows
+// the initial child chain. For parallel states, follows the first region's
+// initial child (use LeafTargets for all regions).
 func (m *Machine[C]) LeafTarget(id core.StateID) core.StateID {
 	for {
 		s, ok := m.states[id]
 		if !ok || len(s.children) == 0 {
 			return id
 		}
-		id = s.initial
+		if s.parallel {
+			// Follow first region for single-leaf compat; callers that need
+			// all regions must use LeafTargets.
+			id = s.children[0].id
+		} else {
+			id = s.initial
+		}
 	}
+}
+
+// LeafTargets returns all initial leaf states reachable from id.
+// For atomic states: [id].
+// For compound OR states: the single leaf via the initial child chain.
+// For parallel states: one leaf per region (in definition order).
+func (m *Machine[C]) LeafTargets(id core.StateID) []core.StateID {
+	s, ok := m.states[id]
+	if !ok || len(s.children) == 0 {
+		return []core.StateID{id}
+	}
+	if s.parallel {
+		var result []core.StateID
+		for _, child := range s.children {
+			result = append(result, m.LeafTargets(child.id)...)
+		}
+		return result
+	}
+	return m.LeafTargets(s.initial)
+}
+
+// InitialLeaves returns all active leaf states when the machine first starts.
+func (m *Machine[C]) InitialLeaves() []core.StateID {
+	return m.LeafTargets(m.initial)
 }
 
 // LCCA returns the Least Common Compound Ancestor of s1 and s2 — the deepest
@@ -199,6 +270,28 @@ func (m *Machine[C]) Configuration(leaf core.StateID) []core.StateID {
 		path[i], path[j] = path[j], path[i]
 	}
 	return path
+}
+
+// ConfigurationOf returns the active configuration for a set of leaf states
+// (used when parallel regions are active). All ancestors of every leaf are
+// included, deduplicated, and returned in definition order (outermost first).
+func (m *Machine[C]) ConfigurationOf(leaves []core.StateID) []core.StateID {
+	if len(leaves) == 1 {
+		return m.Configuration(leaves[0])
+	}
+	seen := make(map[core.StateID]bool)
+	for _, leaf := range leaves {
+		for s := m.states[leaf]; s != nil; s = s.parent {
+			seen[s.id] = true
+		}
+	}
+	var result []core.StateID
+	for _, id := range m.order {
+		if seen[id] {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 // ─── Inspection API (used by viz package) ────────────────────────────────────
@@ -307,7 +400,8 @@ type compiledState[C any] struct {
 	id          core.StateID
 	parent      *compiledState[C]    // nil for top-level states
 	children    []*compiledState[C]  // in definition order; empty for atomic states
-	initial     core.StateID         // initial child (only set when len(children)>0)
+	initial     core.StateID         // initial child for OR compound states
+	parallel    bool                 // AND-node: all children active simultaneously
 	transitions map[core.EventType][]*compiledTransition[C]
 	afterConfs  []*compiledAfter[C]
 	always      []*compiledTransition[C]

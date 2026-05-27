@@ -53,6 +53,19 @@ func (b *Builder[C]) State(id string, configure ...func(*StateBuilder[C])) *Buil
 	return b
 }
 
+// Parallel declares a parallel (AND) state. All direct children are regions
+// that run concurrently: every region is entered on entry and each region
+// processes events independently. The machine stays in the parallel state
+// until a transition exits it, or until all regions reach a final state.
+func (b *Builder[C]) Parallel(id string, configure ...func(*StateBuilder[C])) *Builder[C] {
+	sc := &stateConfig[C]{id: id, parallel: true}
+	if len(configure) > 0 {
+		configure[0](&StateBuilder[C]{cfg: sc})
+	}
+	b.cfg.states = append(b.cfg.states, sc)
+	return b
+}
+
 // Build compiles and validates the machine. Returns an error if the
 // definition is invalid (unknown targets, missing initial state, etc.).
 func (b *Builder[C]) Build() (*Machine[C], error) {
@@ -175,6 +188,17 @@ func (s *StateBuilder[C]) Invoke(fn InvokeFn[C]) *StateBuilder[C] {
 //	})
 func (s *StateBuilder[C]) State(id string, configure ...func(*StateBuilder[C])) *StateBuilder[C] {
 	child := &stateConfig[C]{id: id}
+	if len(configure) > 0 {
+		configure[0](&StateBuilder[C]{cfg: child})
+	}
+	s.cfg.children = append(s.cfg.children, child)
+	return s
+}
+
+// Parallel declares a parallel (AND) child state inside this state.
+// All direct children of the parallel state are concurrent regions.
+func (s *StateBuilder[C]) Parallel(id string, configure ...func(*StateBuilder[C])) *StateBuilder[C] {
+	child := &stateConfig[C]{id: id, parallel: true}
 	if len(configure) > 0 {
 		configure[0](&StateBuilder[C]{cfg: child})
 	}
