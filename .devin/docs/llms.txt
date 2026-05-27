@@ -1,0 +1,42 @@
+# statecraft — agent documentation index
+
+Use these files to understand the codebase before making changes.
+
+## Core docs (read first)
+
+- AGENTS.md — setup, architecture, testing, style
+- statecraft.go — public API and quick start
+- model/builder.go — how to declare machines (flat, compound, parallel, OnDone)
+- model/compile.go — compile-time validation rules
+- runtime/service.go — event loop, SCXML macrostep, done events
+
+## Examples
+
+- examples/trafficlight/main.go — simple cyclic FSM
+- examples/authflow/main.go — guards, After timers, Final state, Subscribe
+- examples/doceditor/main.go — parallel regions, OnDone, Save/Restore
+
+## Tests (behavioral reference)
+
+- model/compile_test.go — validation errors
+- runtime/service_test.go — runtime semantics (flat, hierarchical, parallel, done events, After, invoke)
+- persist/persist_test.go — Save/Restore round-trips
+- actor/actor_test.go — supervision strategies
+- testkit/harness_test.go — synchronous test patterns (AssertIn, AssertLeaves, OnDone)
+- viz/viz_test.go — diagram output
+
+## Package map
+
+- core/ — Event, StateID, Clock, errors
+- model/ — Builder, Machine, compound/parallel states, guards, actions, invoke, OnDone
+- runtime/ — Service, Scheduler, Snapshot, subscribers, Restore
+- actor/ — System, Ref, supervision (NoRestart, RestartAlways, RestartN)
+- persist/ — Checkpoint, Save, Restore
+- viz/ — ToMermaid, ToGraphviz (compound/parallel cluster rendering)
+- testkit/ — Harness for deterministic tests (hierarchical/parallel aware)
+- bench/ — performance benchmarks
+
+## External Devin docs
+
+- Devin CLI index: https://cli.devin.ai/docs/llms.txt
+- Devin platform index: https://docs.devin.ai/llms.txt
