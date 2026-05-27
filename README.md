@@ -30,12 +30,29 @@ fmt.Println(svc.State()) // "green"
 - **Visualization** ---> Mermaid and Graphviz diagrams from any compiled machine
 - **Testkit** ---> synchronous harness for deterministic unit tests, no goroutines needed
 
+## Diagrams
+
+**Traffic light** — flat FSM
+
+![traffic-light](docs/diagrams/traffic-light.svg)
+
+**Auth flow** — guards, delayed transitions, final state
+
+![auth-flow](docs/diagrams/auth-flow.svg)
+
+**Doc editor** — parallel regions, OnDone
+
+![doc-editor](docs/diagrams/doc-editor.svg)
+
+> Regenerate with `go run ./cmd/viz` (requires `graphviz`: `brew install graphviz`)
+
 ## Quick start
 
 ```bash
 go test ./...
 go run ./examples/trafficlight
 go run ./examples/doceditor   # parallel regions + persistence
+go run ./cmd/viz               # regenerate SVG diagrams → docs/diagrams/
 ```
 
 ## Prior art & research
