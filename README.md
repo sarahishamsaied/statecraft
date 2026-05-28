@@ -30,6 +30,30 @@ fmt.Println(svc.State()) // "green"
 - **Visualization** ---> Mermaid and Graphviz diagrams from any compiled machine
 - **Testkit** ---> synchronous harness for deterministic unit tests, no goroutines needed
 
+# Formal Automata Mapping
+
+Classical finite automaton: **( Q, Σ, δ, q0, F )**
+
+| Symbol | Meaning | statecraft |
+|--------|---------|-----------|
+| Q | set of all states | `machine.StateIDs()` |
+| Σ | alphabet, all valid input symbols (events) | `machine.Transitions()` → `.Event` fields |
+| δ | transition function | `machine.ResolveTransition(state, ctx, event)` |
+| q0 | initial state | `machine.InitialLeaves()` |
+| F | set of accepting / final states | states where `machine.IsFinal(id) == true` |
+| δ(q, σ)  ->  q' | given state + event, returns next state | `target, actions, ok := machine.ResolveTransition(q, ctx, σ)` |
+
+## Where statecraft extends the classical model
+
+| Extension | Why | statecraft |
+|-----------|-----|-----------|
+| δ(q, **C**, σ) -> q' | transitions can be guarded by context | `GuardFn[C]` on each transition |
+| q is a **set** of leaves | parallel regions mean multiple active states | `service.Snapshot().Leaves` |
+| Σ includes synthetic events | timers and done events are auto-generated | `statecraft.after.*`, `done.state.*` |
+| Q is hierarchical | compound/parallel states nest | `machine.Parent(id)`, `machine.Children(id)` |
+
+
+
 ## Diagrams
 
 **Traffic light** , flat FSM
