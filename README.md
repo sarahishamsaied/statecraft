@@ -62,6 +62,8 @@ The full TCP state machine from the spec: 11 states, 10 event types, sequence nu
 `TIME_WAIT` uses `s.After(2*MSL, "CLOSED")` matching the RFC verbatim.
 Three `Invoke` callbacks simulate the remote peer, so the machine drives itself through handshake, data transfer, and four-way teardown.
 
+[Full walkthrough](docs/tcp-example.md)
+
 ```
 go run ./examples/tcp
 ```
