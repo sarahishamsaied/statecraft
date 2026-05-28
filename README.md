@@ -54,6 +54,51 @@ Classical finite automaton: **( Q, Σ, δ, q0, F )**
 
 
 
+## Examples
+
+### TCP connection (RFC 793)
+
+The full TCP state machine from the spec: 11 states, 10 event types, sequence numbers in context.
+`TIME_WAIT` uses `s.After(2*MSL, "CLOSED")` matching the RFC verbatim.
+Three `Invoke` callbacks simulate the remote peer, so the machine drives itself through handshake, data transfer, and four-way teardown.
+
+```
+go run ./examples/tcp
+```
+
+```
+── three-way handshake ──────────────────────────────
+  → SYN       seq=7823
+  ← SYN,ACK   seq=0      ack=7824
+  → ACK       seq=7824   ack=1
+SYN_SENT       → ESTABLISHED
+
+── data transfer ────────────────────────────────────
+  → DATA      seq=7825   len=12
+  ← DATA      seq=1      len=12
+
+── four-way teardown ────────────────────────────────
+  → FIN       seq=7837   ack=13
+ESTABLISHED    → FIN_WAIT_1
+  ← ACK       seq=13     ack=7838
+FIN_WAIT_1     → FIN_WAIT_2
+  ← FIN       seq=14     ack=7838
+  → ACK       seq=7838   ack=15
+FIN_WAIT_2     → TIME_WAIT
+TIME_WAIT      → CLOSED
+```
+
+![tcp-rfc793](docs/diagrams/tcp-rfc793.svg)
+
+### Other examples
+
+```bash
+go run ./examples/trafficlight  # flat FSM
+go run ./examples/authflow      # guards + timeouts + final state
+go run ./examples/doceditor     # parallel regions + OnDone
+go run ./examples/eightpuzzle   # Extended FA: 181k board configs, 3 control states
+```
+
 ## Diagrams
 
 **Traffic light** , flat FSM
@@ -74,9 +119,8 @@ Classical finite automaton: **( Q, Σ, δ, q0, F )**
 
 ```bash
 go test ./...
-go run ./examples/trafficlight
-go run ./examples/doceditor   # parallel regions + persistence
-go run ./cmd/viz               # regenerate SVG diagrams → docs/diagrams/
+go run ./examples/tcp
+go run ./cmd/viz   # regenerate SVG diagrams → docs/diagrams/
 ```
 
 ## Prior art & research
