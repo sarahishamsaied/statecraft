@@ -138,12 +138,12 @@ func TestSupervision_RestartAlways_RestartsOnPanic(t *testing.T) {
 
 	mustSend(t, ref, core.E("BOOM"))
 
-	// ref.Done() must NOT close — the actor should restart, not stop permanently.
+	// ref.Done() must NOT close , the actor should restart, not stop permanently.
 	select {
 	case <-ref.Done():
 		t.Fatal("actor stopped instead of restarting with RestartAlways")
 	case <-time.After(100 * time.Millisecond):
-		// Good — still running
+		// Good , still running
 	}
 
 	// Wait for restart then subscribe on the new service instance and verify.
@@ -162,7 +162,7 @@ func TestSupervision_RestartN_RespectsLimit(t *testing.T) {
 		actor.WithStrategy(actor.RestartN, 2))
 	defer sys.Stop()
 
-	// Trigger 3 panics — the third exhausts the restart budget.
+	// Trigger 3 panics , the third exhausts the restart budget.
 	for range 3 {
 		mustSend(t, ref, core.E("BOOM"))
 		time.Sleep(40 * time.Millisecond)
@@ -180,7 +180,7 @@ func TestSupervision_RestartN_RespectsLimit(t *testing.T) {
 func TestActorToActor_InvokeMessaging(t *testing.T) {
 	// "dst" waits for a PING event then moves to "done".
 	// "src" on entry to its initial state invokes a function that immediately
-	// sends PING to dst — demonstrating actor-to-actor communication.
+	// sends PING to dst , demonstrating actor-to-actor communication.
 	type srcCtx struct{}
 	type dstCtx struct{}
 

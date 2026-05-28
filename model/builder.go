@@ -29,7 +29,7 @@ func New[C any](id string) *Builder[C] {
 }
 
 // Context sets the initial context value for every new Service started from
-// this machine. The value is copied by value — use a pointer type if you
+// this machine. The value is copied by value  use a pointer type if you
 // need reference semantics (but be aware of concurrent access).
 func (b *Builder[C]) Context(initial C) *Builder[C] {
 	b.cfg.context = initial
@@ -107,7 +107,7 @@ func (s *StateBuilder[C]) On(event, target string, opts ...TransitionOption[C]) 
 }
 
 // Always adds an automatic (null) transition that is evaluated after every
-// event step — including initial state entry. The first Always whose guard
+// event step  including initial state entry. The first Always whose guard
 // passes fires immediately, without waiting for any external event.
 //
 // Always transitions are checked in definition order. A guardless Always
@@ -119,7 +119,7 @@ func (s *StateBuilder[C]) On(event, target string, opts ...TransitionOption[C]) 
 //
 //	s.Always("paid",    model.When[C](func(c C, _ core.Event) bool { return c.Balance >= c.Price }))
 //	s.Always("overdue", model.When[C](func(c C, _ core.Event) bool { return c.DaysPastDue > 30 }))
-//	s.Always("pending") // fallback — always fires if none above matched
+//	s.Always("pending") // fallback  always fires if none above matched
 func (s *StateBuilder[C]) Always(target string, opts ...TransitionOption[C]) *StateBuilder[C] {
 	tc := transitionConfig[C]{target: target}
 	for _, o := range opts {
@@ -131,10 +131,10 @@ func (s *StateBuilder[C]) Always(target string, opts ...TransitionOption[C]) *St
 
 // After adds a delayed transition that fires after duration d if the machine
 // is still in this state. Timers are scoped to the state: exiting the state
-// cancels the timer automatically, preventing stale timer events.
+// cancels the timer automatically, preventing stale timer events
 func (s *StateBuilder[C]) After(d time.Duration, target string, opts ...TransitionOption[C]) *StateBuilder[C] {
 	ac := afterStateConfig[C]{delay: d, target: target}
-	// Options are borrowed from the transition option set.
+	// Options are borrowed from the transition option set
 	for _, o := range opts {
 		tc := transitionConfig[C]{}
 		o(&tc)
@@ -145,14 +145,14 @@ func (s *StateBuilder[C]) After(d time.Duration, target string, opts ...Transiti
 	return s
 }
 
-// Entry registers one or more actions to run on state entry.
+// Entry registers one or more actions to run on state entry
 // Actions execute in the order they are registered.
 func (s *StateBuilder[C]) Entry(actions ...ActionFn[C]) *StateBuilder[C] {
 	s.cfg.onEntry = append(s.cfg.onEntry, actions...)
 	return s
 }
 
-// Exit registers one or more actions to run on state exit.
+// Exit registers one or more actions to run on state exit
 func (s *StateBuilder[C]) Exit(actions ...ActionFn[C]) *StateBuilder[C] {
 	s.cfg.onExit = append(s.cfg.onExit, actions...)
 	return s
@@ -160,7 +160,7 @@ func (s *StateBuilder[C]) Exit(actions ...ActionFn[C]) *StateBuilder[C] {
 
 // Final marks this state as terminal. When the machine enters a final state
 // it keeps running (can still receive events) but exposes IsFinal() == true
-// on its snapshot.
+// on its snapshot
 func (s *StateBuilder[C]) Final() *StateBuilder[C] {
 	s.cfg.final = true
 	return s
@@ -214,7 +214,7 @@ func (s *StateBuilder[C]) Initial(id string) *StateBuilder[C] {
 }
 
 // OnDone adds a transition that fires when this compound or parallel state
-// completes — i.e. all active leaves within the state are final. For compound
+// completes  i.e. all active leaves within the state are final. For compound
 // OR states this fires when the active child is a final state; for parallel
 // states it fires when every region contains a final active leaf.
 //

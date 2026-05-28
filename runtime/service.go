@@ -508,7 +508,9 @@ func (s *Service[C]) applyTransitions(ev core.Event, pending []pendingTrans[C]) 
 	s.raiseDoneEvents(entryOrder)
 
 	// ── 7. Publish snapshot ────────────────────────────────────────────────
-	s.storeAndNotify(ev, !leavesEqual(s.leaves, prevLeaves))
+	// Always notify: applyTransitions is only called when a transition fired.
+	// Self-transitions (A→A) leave leaves unchanged but still update context.
+	s.storeAndNotify(ev, true)
 }
 
 func leavesEqual(a, b []core.StateID) bool {

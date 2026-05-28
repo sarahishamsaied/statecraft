@@ -35,7 +35,8 @@ type Snapshot[C any] struct {
 	// nil for the initial snapshot produced when the machine starts.
 	Event core.Event
 
-	// Changed is true when the active state changed as a result of Event.
+	// Changed is true when a transition fired as a result of Event (including
+	// self-transitions where the leaf state stays the same but context updates).
 	// False means the event was received but no transition matched.
 	Changed bool
 
